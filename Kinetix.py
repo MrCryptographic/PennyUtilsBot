@@ -83,8 +83,9 @@ def load_data():
         "warnings": {},
         "logs": {},
         "devtest": {},
-        "blacklist": [],
-        "personas": {}, # Stores user -> persona preference
+        "blacklist": {"all": []},
+        "disabled_commands": {"global": [], "guilds": {}},
+        "personas": {}, 
         "auto_replies": [
             f"Oh, look who it is! {EMOJI_SMIRK}",
             f"H-hey! {EMOJI_SHY}",
@@ -101,6 +102,11 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
+            
+            # Migrate legacy list blacklist format to new dict format
+            if "blacklist" in loaded and isinstance(loaded["blacklist"], list):
+                loaded["blacklist"] = {"all": loaded["blacklist"]}
+                
             for key, val in default_data.items():
                 if key not in loaded:
                     loaded[key] = val
@@ -248,8 +254,34 @@ def owner_only():
 
 @bot.check
 async def blacklist_check(ctx):
-    if ctx.author.id in data.get("blacklist", []):
+    uid = ctx.author.id
+    bl = data.get("blacklist", {})
+    
+    # Check total blacklist
+    if uid in bl.get("all", []):
         raise commands.CheckFailure("BLACKLISTED")
+        
+    # Check command-specific blacklist
+    if ctx.command and uid in bl.get(ctx.command.name, []):
+        raise commands.CheckFailure("BLACKLISTED")
+        
+    return True
+
+
+@bot.check
+async def disabled_command_check(ctx):
+    if not ctx.command:
+        return True
+        
+    cmd_name = ctx.command.name
+    disabled = data.get("disabled_commands", {"global": [], "guilds": {}})
+    
+    if cmd_name in disabled.get("global", []):
+        raise commands.CheckFailure(f"DISABLED_GLOBAL:{cmd_name}")
+        
+    if ctx.guild and cmd_name in disabled.get("guilds", {}).get(str(ctx.guild.id), []):
+        raise commands.CheckFailure(f"DISABLED_SERVER:{cmd_name}")
+        
     return True
 
 
@@ -342,7 +374,6 @@ async def log_action(guild, message):
 # AI CHATBOT SYSTEM (LM STUDIO INTEGRATION)
 # ============================================================
 
-# Short-term memory for users to keep context
 user_chat_history = {}
 
 @bot.command()
@@ -360,11 +391,9 @@ async def persona(ctx, name: str = None):
         await ctx.send(f"Unknown persona! {EMOJI_BOYKISSER_HUH}")
         return
 
-    # Update persona
     data["personas"][str(ctx.author.id)] = name
     save_data()
     
-    # Wipe their short-term memory so the old persona doesn't bleed into the new one
     user_chat_history.pop(ctx.author.id, None)
     
     await ctx.send(f"Your AI persona has been updated to **{name}**. Conversation history cleared! {EMOJI_BLUSH}")
@@ -386,18 +415,14 @@ async def chat(ctx, *, message: str = None):
     if user_id not in user_chat_history:
         user_chat_history[user_id] = []
 
-    # Limit history to the last 10 messages (5 turns) to save tokens/memory
     history = user_chat_history[user_id][-10:]
 
     async with ctx.typing():
-        # Call to the new ai_chat module
         response = await ai_chat.generate_response(message, persona=persona_name, history=history)
 
-        # Log the conversation into their history array
         user_chat_history[user_id].append({"role": "user", "content": message})
         user_chat_history[user_id].append({"role": "assistant", "content": response})
 
-        # Discord 2000 character limit handler (split into chunks if it's too long)
         if len(response) > 1990:
             chunks = [response[i:i+1990] for i in range(0, len(response), 1990)]
             for chunk in chunks:
@@ -869,202 +894,174 @@ class FavoritesView(discord.ui.View):
         self.page = 0
         self.rebuild_ui()
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                "Only the command author can control this menu!",
+                ephemeral=True
+            )
+            return False
+        return True
+
     def get_list(self):
         if self.mode == "guild":
             return favorites_data["guilds"].get(str(self.ctx.guild.id), [])
-        else:
-            return favorites_data["users"].get(str(self.ctx.author.id), [])
+        return favorites_data["users"].get(str(self.ctx.author.id), [])
+
+    def get_embed(self):
+        favorites = self.get_list()
+        title = "🌐 Server Favorites" if self.mode == "guild" else "👤 My Personal Favorites"
+        embed = discord.Embed(title=title, color=discord.Color.gold())
+        if not favorites:
+            embed.description = "No favorites saved yet! Use `;favorite` to save a track."
+            return embed
+
+        page_size = 6
+        total_pages = max(1, (len(favorites) + page_size - 1) // page_size)
+        self.page = min(self.page, total_pages - 1)
+        start = self.page * page_size
+        lines = []
+        for index, item in enumerate(favorites[start:start + page_size], start + 1):
+            title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=50)
+            url = item.get("url", "")
+            lines.append(f"`{index}.` [{title}]({url})")
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total saved: {len(favorites)}")
+        return embed
 
     def rebuild_ui(self):
         self.clear_items()
-        fav_list = self.get_list()
-        items_per_page = 6
-        total_pages = max(1, (len(fav_list) + items_per_page - 1) // items_per_page)
+        favorites = self.get_list()
+        page_size = 6
+        total_pages = max(1, (len(favorites) + page_size - 1) // page_size)
         self.page = min(self.page, total_pages - 1)
 
-        toggle_label = "Switch to My Favorites 👤" if self.mode == "guild" else "Switch to Server Favorites 🌐"
-        toggle_btn = discord.ui.Button(label=toggle_label, style=discord.ButtonStyle.primary, row=0)
-        toggle_btn.callback = self.toggle_mode
-        self.add_item(toggle_btn)
+        toggle = discord.ui.Button(
+            label="Switch to My Favorites" if self.mode == "guild" else "Switch to Server Favorites",
+            style=discord.ButtonStyle.primary,
+            row=0
+        )
+        toggle.callback = self.toggle_mode
+        self.add_item(toggle)
 
-        play_all_btn = discord.ui.Button(label="▶️ Play All Favs", style=discord.ButtonStyle.success, row=0, disabled=(len(fav_list) == 0))
-        play_all_btn.callback = self.play_all_favs
-        self.add_item(play_all_btn)
+        play_all = discord.ui.Button(
+            label="▶️ Play All", style=discord.ButtonStyle.success, row=0, disabled=not favorites
+        )
+        play_all.callback = self.play_all
+        self.add_item(play_all)
 
-        prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1, disabled=(self.page <= 0))
-        prev_btn.callback = self.prev_page
-        self.add_item(prev_btn)
-
-        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.page >= total_pages - 1))
-        next_btn.callback = self.next_page
-        self.add_item(next_btn)
-
-        start = self.page * items_per_page
-        end = start + items_per_page
-        current_page_items = fav_list[start:end]
-
-        if current_page_items:
-            play_options = []
-            del_options = []
-            for idx, item in enumerate(current_page_items, start):
-                clean_title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=55)
-                added_date = str(item.get("added_at", ""))[:90]
-                label_text = f"{idx + 1}. {clean_title}"[:100]
-                play_options.append(discord.SelectOption(label=label_text, value=str(idx), description=added_date))
-                del_options.append(discord.SelectOption(label=f"Delete #{idx + 1}: {clean_title[:80]}"[:100], value=str(idx), description=added_date))
-
-            select = discord.ui.Select(placeholder="Select a song to queue/play...", options=play_options, row=2)
+        if favorites:
+            options = []
+            start = self.page * page_size
+            for index, item in enumerate(favorites[start:start + page_size], start):
+                title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=80)
+                options.append(discord.SelectOption(label=f"{index + 1}. {title}"[:100], value=str(index)))
+            select = discord.ui.Select(placeholder="Play a favorite...", options=options, row=1)
             select.callback = self.select_song
             self.add_item(select)
 
-            remove_select = discord.ui.Select(placeholder="Delete a favorite...", options=del_options, row=3)
-            remove_select.callback = self.remove_song
-            self.add_item(remove_select)
+            remove = discord.ui.Select(
+                placeholder="Remove a favorite...",
+                options=[
+                    discord.SelectOption(label=f"Remove #{start + offset + 1}: {option.label.split('. ', 1)[-1]}"[:100],
+                                         value=option.value)
+                    for offset, option in enumerate(options)
+                ],
+                row=2
+            )
+            remove.callback = self.remove_song
+            self.add_item(remove)
 
-    def get_embed(self):
-        fav_list = self.get_list()
-        title = "🌐 Server Favorites" if self.mode == "guild" else "👤 My Personal Favorites (All Servers)"
-        embed = discord.Embed(title=title, color=discord.Color.gold())
-
-        if not fav_list:
-            embed.description = "No favorites saved yet! Use `;favorite` to save your first track."
-            return embed
-
-        items_per_page = 6
-        total_pages = max(1, (len(fav_list) + items_per_page - 1) // items_per_page)
-        self.page = min(self.page, total_pages - 1)
-
-        start = self.page * items_per_page
-        end = start + items_per_page
-        current_slice = fav_list[start:end]
-
-        lines = ""
-        for idx, item in enumerate(current_slice, start + 1):
-            clean_title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=50)
-            url = item.get("url", "")
-            extra = f" • <@{item['user_id']}>" if self.mode == "guild" and "user_id" in item else ""
-            line = f"`{idx}.` [{clean_title}]({url}){extra}\n"
-            if len(lines) + len(line) < 3500:
-                lines += line
-
-        embed.description = lines
-        embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total saved: {len(fav_list)}")
-        return embed
-
-    async def prev_page(self, interaction: discord.Interaction):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
-            return
-        if self.page > 0:
-            self.page -= 1
-            self.rebuild_ui()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
-            return
-        fav_list = self.get_list()
-        total_pages = max(1, (len(fav_list) + 5) // 6)
-        if self.page < total_pages - 1:
-            self.page += 1
-            self.rebuild_ui()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        previous = discord.ui.Button(
+            label="◀ Prev", style=discord.ButtonStyle.secondary, row=3, disabled=self.page == 0
+        )
+        previous.callback = self.prev_page
+        self.add_item(previous)
+        following = discord.ui.Button(
+            label="Next ▶", style=discord.ButtonStyle.secondary,
+            row=3, disabled=self.page >= total_pages - 1
+        )
+        following.callback = self.next_page
+        self.add_item(following)
 
     async def toggle_mode(self, interaction: discord.Interaction):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
-            return
-
         self.mode = "user" if self.mode == "guild" else "guild"
         self.page = 0
         self.rebuild_ui()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    async def play_all_favs(self, interaction: discord.Interaction):
-        fav_list = self.get_list()
-        if not fav_list:
+    async def play_all(self, interaction: discord.Interaction):
+        favorites = self.get_list()
+        if not favorites:
             await interaction.response.send_message("No favorites to play!", ephemeral=True)
             return
-
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("You must be in a voice channel first!", ephemeral=True)
+            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
             return
 
         await interaction.response.defer()
-
         voice_channel = interaction.user.voice.channel
-        vc = interaction.guild.voice_client
-        if not vc:
-            vc = await voice_channel.connect()
-        elif vc.channel != voice_channel:
-            await vc.move_to(voice_channel)
+        voice_client = interaction.guild.voice_client
+        if voice_client is None:
+            voice_client = await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-
-        for item in fav_list:
-            state["queue"].append({
-                "title": item["title"],
-                "webpage_url": item["url"]
-            })
-
-        if not vc.is_playing() and not vc.is_paused():
+        state["queue"].extend(
+            {"title": track["title"], "webpage_url": track["url"]}
+            for track in favorites
+        )
+        if not voice_client.is_playing() and not voice_client.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing all **{len(fav_list)}** favorite(s)! 🎶 {EMOJI_DANCING}")
+            await self.ctx.send(f"Now playing all **{len(favorites)}** favorites! 🎶")
         else:
-            await self.ctx.send(f"Added all **{len(fav_list)}** favorite(s) to the queue! 🎶 {EMOJI_BLUSH}")
+            await self.ctx.send(f"Queued all **{len(favorites)}** favorites! 🎶")
+
+    async def prev_page(self, interaction: discord.Interaction):
+        self.page -= 1
+        self.rebuild_ui()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    async def next_page(self, interaction: discord.Interaction):
+        self.page += 1
+        self.rebuild_ui()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     async def select_song(self, interaction: discord.Interaction):
-        fav_list = self.get_list()
-        idx = int(interaction.data["values"][0])
-        selected_track = fav_list[idx]
-
+        index = int(interaction.data["values"][0])
+        track = self.get_list()[index]
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("You must be in a voice channel to play favorites!", ephemeral=True)
+            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
             return
 
         await interaction.response.defer()
-
         voice_channel = interaction.user.voice.channel
-        vc = interaction.guild.voice_client
-        if not vc:
-            vc = await voice_channel.connect()
-        elif vc.channel != voice_channel:
-            await vc.move_to(voice_channel)
+        voice_client = interaction.guild.voice_client
+        if voice_client is None:
+            voice_client = await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-        state["queue"].append({
-            "title": selected_track["title"],
-            "webpage_url": selected_track["url"]
-        })
-
-        if not vc.is_playing() and not vc.is_paused():
+        state["queue"].append({"title": track["title"], "webpage_url": track["url"]})
+        if not voice_client.is_playing() and not voice_client.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing from favorites: **{selected_track['title']}**! {EMOJI_DANCING}")
+            await self.ctx.send(f"Now playing **{track['title']}** from favorites! {EMOJI_DANCING}")
         else:
-            await self.ctx.send(f"Queued from favorites: **{selected_track['title']}** (Position #{len(state['queue'])}) {EMOJI_BLUSH}")
+            await self.ctx.send(f"Queued **{track['title']}** from favorites. {EMOJI_BLUSH}")
 
     async def remove_song(self, interaction: discord.Interaction):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("You cannot delete someone else's favorites!", ephemeral=True)
-            return
+        index = int(interaction.data["values"][0])
+        favorites = self.get_list()
+        removed = favorites.pop(index)
+        save_favorites()
+        self.rebuild_ui()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        await self.ctx.send(f"Removed **{removed['title']}** from favorites.", delete_after=5)
 
-        idx = int(interaction.data["values"][0])
-        fav_list = self.get_list()
-
-        if 0 <= idx < len(fav_list):
-            removed = fav_list.pop(idx)
-            save_favorites()
-            self.rebuild_ui()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
-            await self.ctx.send(f"Removed **{removed['title']}** from favorites.", delete_after=5)
-
-
-# ============================================================
-# PLAYLIST INTERACTIVE VIEW
-# ============================================================
 
 class PlaylistView(discord.ui.View):
     def __init__(self, ctx, pl_name: str, is_server: bool = False):
@@ -1075,61 +1072,55 @@ class PlaylistView(discord.ui.View):
         self.page = 0
         self.update_buttons()
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                "Only the command author can control this menu!",
+                ephemeral=True
+            )
+            return False
+        return True
+
     def get_tracks(self):
         if self.is_server:
             return playlists_data["guilds"].get(str(self.ctx.guild.id), {}).get(self.pl_name, [])
-        else:
-            return playlists_data["users"].get(str(self.ctx.author.id), {}).get(self.pl_name, [])
+        return playlists_data["users"].get(str(self.ctx.author.id), {}).get(self.pl_name, [])
 
     def get_embed(self):
         tracks = self.get_tracks()
-        tag = "🌐 Server Playlist" if self.is_server else "👤 Personal Playlist"
-        embed = discord.Embed(title=f"📋 {self.pl_name} ({tag})", color=discord.Color.blue())
-
+        kind = "Server" if self.is_server else "Personal"
+        embed = discord.Embed(title=f"📋 {self.pl_name} ({kind} Playlist)", color=discord.Color.blue())
         if not tracks:
             embed.description = "This playlist is currently empty!"
             return embed
 
-        items_per_page = 8
-        total_pages = max(1, (len(tracks) + items_per_page - 1) // items_per_page)
+        page_size = 8
+        total_pages = max(1, (len(tracks) + page_size - 1) // page_size)
         self.page = min(self.page, total_pages - 1)
-
-        start = self.page * items_per_page
-        end = start + items_per_page
-        current_slice = tracks[start:end]
-
-        lines = ""
-        for idx, t in enumerate(current_slice, start + 1):
-            clean_title = sanitize_markdown(t["title"], max_len=50)
-            lines += f"`{idx}.` [{clean_title}]({t['url']})\n"
-
-        embed.description = lines
+        start = self.page * page_size
+        embed.description = "\n".join(
+            f"`{index}.` [{sanitize_markdown(track['title'], max_len=50)}]({track['url']})"
+            for index, track in enumerate(tracks[start:start + page_size], start + 1)
+        )
         embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total tracks: {len(tracks)}")
         return embed
 
     def update_buttons(self):
-        tracks = self.get_tracks()
-        items_per_page = 8
-        total_pages = max(1, (len(tracks) + items_per_page - 1) // items_per_page)
-
-        self.prev_btn.disabled = (self.page <= 0)
-        self.next_btn.disabled = (self.page >= total_pages - 1)
+        total_pages = max(1, (len(self.get_tracks()) + 7) // 8)
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= total_pages - 1
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page > 0:
-            self.page -= 1
-            self.update_buttons()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        self.page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        tracks = self.get_tracks()
-        total_pages = max(1, (len(tracks) + 7) // 8)
-        if self.page < total_pages - 1:
-            self.page += 1
-            self.update_buttons()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        self.page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="▶️ Play Playlist", style=discord.ButtonStyle.success)
     async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1137,34 +1128,26 @@ class PlaylistView(discord.ui.View):
         if not tracks:
             await interaction.response.send_message("This playlist is empty!", ephemeral=True)
             return
-
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("You must be in a voice channel first!", ephemeral=True)
+            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
             return
 
         await interaction.response.defer()
-
         voice_channel = interaction.user.voice.channel
-        vc = interaction.guild.voice_client
-        if not vc:
-            vc = await voice_channel.connect()
-        elif vc.channel != voice_channel:
-            await vc.move_to(voice_channel)
+        voice_client = interaction.guild.voice_client
+        if voice_client is None:
+            voice_client = await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-
-        for item in tracks:
-            state["queue"].append({
-                "title": item["title"],
-                "webpage_url": item["url"]
-            })
-
-        if not vc.is_playing() and not vc.is_paused():
+        state["queue"].extend({"title": track["title"], "webpage_url": track["url"]} for track in tracks)
+        if not voice_client.is_playing() and not voice_client.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_DANCING}")
+            await self.ctx.send(f"Now playing playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶")
         else:
-            await self.ctx.send(f"Queued playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_BLUSH}")
+            await self.ctx.send(f"Queued playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶")
 
 
 # ============================================================
@@ -1205,42 +1188,37 @@ async def on_message(message):
 
 
 # ============================================================
-# COMMANDS ADVERTISED BY HELP
+# COMMANDS STILL LISTED IN THE HELP MENU
 # ============================================================
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot kick this user because their highest role is equal to or higher than mine.")
+        await ctx.send("I cannot kick a member whose highest role is equal to or higher than mine.")
         return
-
     await member.kick(reason=reason)
     await ctx.send(f"**{member}** was kicked.\nReason: {reason}")
-    await log_action(
-        ctx.guild,
-        f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
-    )
+    await log_action(ctx.guild, f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot ban this user because their highest role is equal to or higher than mine.")
+        await ctx.send("I cannot ban a member whose highest role is equal to or higher than mine.")
         return
-
     await member.ban(reason=reason)
     await ctx.send(f"**{member}** was banned.\nReason: {reason}")
-    await log_action(
-        ctx.guild,
-        f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
-    )
+    await log_action(ctx.guild, f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(ban_members=True)
 async def unban(ctx, user_id: int):
@@ -1250,15 +1228,12 @@ async def unban(ctx, user_id: int):
     except discord.NotFound:
         await ctx.send("That user is not banned.")
         return
-
     await ctx.send(f"**{user}** was unbanned.")
-    await log_action(
-        ctx.guild,
-        f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}"
-    )
+    await log_action(ctx.guild, f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}")
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(moderate_members=True)
 async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
@@ -1266,9 +1241,8 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
         await ctx.send("The timeout duration must be greater than 0.")
         return
     if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot timeout this user because their role is equal to or higher than mine.")
+        await ctx.send("I cannot timeout a member whose role is equal to or higher than mine.")
         return
-
     until = discord.utils.utcnow() + timedelta(minutes=minutes)
     await member.timeout(until, reason=reason)
     await ctx.send(f"**{member}** was timed out for `{minutes}` minute(s).\nReason: {reason}")
@@ -1280,6 +1254,7 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(moderate_members=True)
 async def untimeout(ctx, member: discord.Member):
@@ -1288,14 +1263,12 @@ async def untimeout(ctx, member: discord.Member):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
-    guild_id = str(ctx.guild.id)
-    user_id = str(member.id)
-    warnings = data.setdefault("warnings", {}).setdefault(guild_id, {}).setdefault(user_id, [])
+    warnings = data.setdefault("warnings", {}).setdefault(str(ctx.guild.id), {}).setdefault(str(member.id), [])
     warnings.append({"reason": reason, "moderator": ctx.author.id})
     save_data()
-
     await ctx.send(f"⚠️ **{member}** has been warned.\nReason: {reason}\nTotal warnings: `{len(warnings)}`")
     await log_action(
         ctx.guild,
@@ -1305,13 +1278,13 @@ async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 async def warnings(ctx, member: discord.Member):
     entries = data.get("warnings", {}).get(str(ctx.guild.id), {}).get(str(member.id), [])
     if not entries:
         await ctx.send(f"**{member}** has no warnings.")
         return
-
     embed = discord.Embed(title=f"Warnings — {member}", color=discord.Color.orange())
     for index, entry in enumerate(entries, 1):
         moderator = ctx.guild.get_member(entry["moderator"])
@@ -1325,6 +1298,7 @@ async def warnings(ctx, member: discord.Member):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 async def clearwarnings(ctx, member: discord.Member):
     data.get("warnings", {}).get(str(ctx.guild.id), {}).pop(str(member.id), None)
@@ -1333,20 +1307,34 @@ async def clearwarnings(ctx, member: discord.Member):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
-@commands.bot_has_permissions(manage_messages=True)
+@commands.bot_has_permissions(manage_messages=True, read_message_history=True)
 async def purge(ctx, amount: int):
     if amount <= 0:
         await ctx.send("Amount must be greater than 0.")
         return
 
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    confirmation = await ctx.send(f"Deleted `{len(deleted) - 1}` message(s).")
-    await confirmation.delete(delay=3)
-    await log_action(ctx.guild, f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {len(deleted) - 1}")
+    try:
+        deleted = await ctx.channel.purge(
+            limit=amount + 1,
+            reason=f"Message purge requested by {ctx.author} ({ctx.author.id})"
+        )
+    except discord.Forbidden:
+        await ctx.send("I need Manage Messages and Read Message History permissions to purge this channel.")
+        return
+    except discord.HTTPException as error:
+        await ctx.send(f"Discord could not complete the purge: `{error}`")
+        return
+
+    deleted_count = sum(message.id != ctx.message.id for message in deleted)
+    confirmation = await ctx.send(f"Deleted `{deleted_count}` message(s).")
+    await confirmation.delete(delay=5)
+    await log_action(ctx.guild, f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {deleted_count}")
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(manage_channels=True)
 async def slowmode(ctx, seconds: int):
@@ -1358,6 +1346,7 @@ async def slowmode(ctx, seconds: int):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(manage_channels=True)
 async def lock(ctx):
@@ -1368,6 +1357,7 @@ async def lock(ctx):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(manage_channels=True)
 async def unlock(ctx):
@@ -1378,6 +1368,7 @@ async def unlock(ctx):
 
 
 @bot.command()
+@commands.guild_only()
 @moderator_only()
 @commands.bot_has_permissions(manage_nicknames=True)
 async def nick(ctx, member: discord.Member, *, nickname=None):
@@ -1389,11 +1380,8 @@ async def nick(ctx, member: discord.Member, *, nickname=None):
 
 
 @bot.command()
+@commands.guild_only()
 async def serverinfo(ctx):
-    if not ctx.guild:
-        await ctx.send("This command can only be used in a server.")
-        return
-
     guild = ctx.guild
     embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
     embed.add_field(name="Owner", value=f"<@{guild.owner_id}>")
@@ -1407,11 +1395,8 @@ async def serverinfo(ctx):
 
 
 @bot.command()
+@commands.guild_only()
 async def userinfo(ctx, member: discord.Member = None):
-    if not ctx.guild:
-        await ctx.send("This command can only be used in a server.")
-        return
-
     member = member or ctx.author
     embed = discord.Embed(title=str(member), color=member.color)
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -1435,6 +1420,7 @@ async def avatar(ctx, member: discord.Member = None):
 
 
 @bot.command()
+@commands.guild_only()
 async def banner(ctx, member: discord.Member = None):
     member = member or ctx.author
     try:
@@ -1445,7 +1431,6 @@ async def banner(ctx, member: discord.Member = None):
     if not user.banner:
         await ctx.send(f"**{user}** does not have a dynamic banner configured.")
         return
-
     embed = discord.Embed(title=f"{user}'s Banner", color=member.color)
     embed.set_image(url=user.banner.url)
     await ctx.send(embed=embed)
@@ -1471,13 +1456,12 @@ async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
     if user1 == user2:
         await ctx.send(f"You can't ship someone with themselves! {EMOJI_BOYKISSER_HUH}")
         return
-
-    combined_ids = "".join(sorted((str(user1.id), str(user2.id))))
-    percentage = random.Random(combined_ids).randint(0, 100)
+    ids = "".join(sorted((str(user1.id), str(user2.id))))
+    percentage = random.Random(ids).randint(0, 100)
     if percentage < 25:
-        message = f"💔 **{percentage}%**... Yikes, {user1.mention} and {user2.mention} might want to stay just friends. {EMOJI_SHOCKED}"
+        message = f"💔 **{percentage}%**... {user1.mention} and {user2.mention} might want to stay friends. {EMOJI_SHOCKED}"
     elif percentage < 75:
-        message = f"💛 **{percentage}%**! {user1.mention} and {user2.mention} have some decent chemistry! {EMOJI_SMIRK}"
+        message = f"💛 **{percentage}%**! {user1.mention} and {user2.mention} have decent chemistry! {EMOJI_SMIRK}"
     else:
         message = f"💖 **{percentage}%**!!! {user1.mention} and {user2.mention} are a perfect match! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
@@ -1499,64 +1483,68 @@ async def femboy(ctx, member: discord.Member = None):
 @bot.command()
 async def kiss(ctx, member: discord.Member = None):
     if not member:
-        await ctx.send(f"Please mention someone to kiss! {EMOJI_BOYKISSER_HUH}")
+        message = f"Please mention someone to kiss! {EMOJI_BOYKISSER_HUH}"
     elif member == ctx.author:
-        await ctx.send(f"You can't kiss yourself! But here is some love: {EMOJI_SHY}")
+        message = f"You can't kiss yourself! But here is some love: {EMOJI_SHY}"
     else:
-        await ctx.send(f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}")
+        message = f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}"
+    await ctx.send(message)
 
 
 @bot.command()
 async def hug(ctx, member: discord.Member = None):
     if not member:
-        await ctx.send(f"Please mention someone to hug! {EMOJI_BOYKISSER_HUH}")
+        message = f"Please mention someone to hug! {EMOJI_BOYKISSER_HUH}"
     elif member == ctx.author:
-        await ctx.send(f"Self hugs are okay, but here is a big embrace from me! {EMOJI_SHY} {EMOJI_LOVE}")
+        message = f"Self hugs are okay, but here is a big embrace from me! {EMOJI_SHY} {EMOJI_LOVE}"
     else:
-        await ctx.send(f"{ctx.author.mention} gives {member.mention} a warm, comfortable hug! {EMOJI_LOVE} {EMOJI_BLUSH}")
+        message = f"{ctx.author.mention} gives {member.mention} a warm hug! {EMOJI_LOVE} {EMOJI_BLUSH}"
+    await ctx.send(message)
 
 
 @bot.command()
 async def punch(ctx, member: discord.Member = None):
     if not member:
-        await ctx.send(f"Please mention someone to punch! {EMOJI_BOYKISSER_HUH}")
+        message = f"Please mention someone to punch! {EMOJI_BOYKISSER_HUH}"
     elif member == ctx.author:
-        await ctx.send(f"Punching yourself? Don't do that! {EMOJI_BOYKISSER_HUH}")
+        message = f"Punching yourself? Don't do that! {EMOJI_BOYKISSER_HUH}"
     else:
-        await ctx.send(f"{ctx.author.mention} punches {member.mention} straight in the face! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}")
+        message = f"{ctx.author.mention} punches {member.mention}! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}"
+    await ctx.send(message)
 
 
 @bot.command()
 async def attack(ctx, member: discord.Member = None):
     if not member:
         await ctx.send(f"Please mention someone to attack! {EMOJI_BOYKISSER_HUH}")
-    elif member == ctx.author:
+        return
+    if member == ctx.author:
         await ctx.send(f"Why are you trying to attack yourself? {EMOJI_BOYKISSER_HUH}")
-    else:
-        attacks = [
-            f"{ctx.author.mention} charges directly at {member.mention} with a legendary tackle! {EMOJI_BOYKISSER_RIGHT}",
-            f"{ctx.author.mention} attempts to attack {member.mention} with a pillow! {EMOJI_BOYKISSER_HAPPY}",
-            f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
-        ]
-        await ctx.send(random.choice(attacks))
+        return
+    await ctx.send(random.choice([
+        f"{ctx.author.mention} charges at {member.mention} with a legendary tackle! {EMOJI_BOYKISSER_RIGHT}",
+        f"{ctx.author.mention} attempts to attack {member.mention} with a pillow! {EMOJI_BOYKISSER_HAPPY}",
+        f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
+    ]))
 
 
 @bot.command()
 async def boop(ctx, member: discord.Member = None):
     if not member:
-        await ctx.send(f"Please mention someone to boop! {EMOJI_BOYKISSER_HUH}")
+        message = f"Please mention someone to boop! {EMOJI_BOYKISSER_HUH}"
     elif member == ctx.author:
-        await ctx.send(f"You boop your own nose. Cute! {EMOJI_BOYKISSER_BOOP}")
+        message = f"You boop your own nose. Cute! {EMOJI_BOYKISSER_BOOP}"
     else:
-        await ctx.send(f"{ctx.author.mention} walks up and gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}")
+        message = f"{ctx.author.mention} gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}"
+    await ctx.send(message)
 
 
 @bot.command()
 async def dance(ctx, member: discord.Member = None):
     if member:
-        message = f"{ctx.author.mention} and {member.mention} start bustin' it down on the dance floor! {EMOJI_DANCING}"
+        message = f"{ctx.author.mention} and {member.mention} start dancing! {EMOJI_DANCING}"
     else:
-        message = f"{ctx.author.mention} breaks into an energetic dance routine! {EMOJI_DANCING}"
+        message = f"{ctx.author.mention} breaks into an energetic dance! {EMOJI_DANCING}"
     await ctx.send(message)
 
 
@@ -1566,38 +1554,33 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
         return
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate_names = [filename_base]
+    names = [filename_base]
     if filename_base == "basketball.gif":
-        candidate_names.extend([
-            "basketball.png", "basketball.jpg", "basketball.jpeg",
-            "yaoming.gif", "yaoming.png", "yaoming.jpg", "yaoming.jpeg"
-        ])
-
+        names.extend(["basketball.png", "basketball.jpg", "basketball.jpeg",
+                      "yaoming.gif", "yaoming.png", "yaoming.jpg", "yaoming.jpeg"])
     asset_path = next(
         (
-            candidate
-            for name in candidate_names
-            for candidate in (
-                os.path.join(script_dir, "assets", name),
-                os.path.join(script_dir, name)
-            )
-            if os.path.isfile(candidate)
+            path
+            for name in names
+            for path in (os.path.join(script_dir, "assets", name), os.path.join(script_dir, name))
+            if os.path.isfile(path)
         ),
         None
     )
     if asset_path is None:
-        await ctx.send(
-            f"**Error:** `{filename_base}` was not found. Add the meme template to the `assets` folder "
-            "or the bot's root folder."
-        )
+        await ctx.send(f"**Error:** `{filename_base}` was not found in the assets or bot folder.")
         return
 
-    status_msg = await ctx.send(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
-    output_path = os.path.join(script_dir, f"{os.path.splitext(filename_base)[0]}_{ctx.message.id}.gif")
+    status = await ctx.send(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
+    output_path = os.path.join(
+        script_dir,
+        f"{os.path.splitext(os.path.basename(filename_base))[0]}_{ctx.message.id}.gif"
+    )
     try:
         with Image.open(asset_path) as image:
             font = get_meme_font(28, script_dir)
-            chars_per_line = max(10, int((image.width - 24) / max(1, font.getlength("A"))))
+            char_width = font.getlength("A") if hasattr(font, "getlength") else 15
+            chars_per_line = max(10, int((image.width - 24) / max(1, char_width)))
             lines = textwrap.wrap(text.strip(), width=chars_per_line) or [text.strip()]
             line_height = 35
             caption_height = len(lines) * line_height + 24
@@ -1609,13 +1592,13 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
                 draw = ImageDraw.Draw(canvas)
                 y = (caption_height - len(lines) * line_height) // 2
                 for line in lines:
-                    line_width = font.getlength(line)
+                    line_width = font.getlength(line) if hasattr(font, "getlength") else draw.textlength(line, font=font)
                     draw.text(((image.width - line_width) // 2, y), line, fill="black", font=font)
                     y += line_height
                 frames.append(canvas.convert("RGB"))
 
             if not frames:
-                raise ValueError(f"{filename_base} contains no image frames")
+                raise ValueError(f"{filename_base} contains no frames")
             frames[0].save(
                 output_path,
                 format="GIF",
@@ -1626,9 +1609,9 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
             )
 
         await ctx.send(file=discord.File(output_path))
-        await status_msg.delete()
+        await status.delete()
     except (OSError, ValueError, discord.HTTPException) as error:
-        await status_msg.edit(content=f"Could not generate {meme_name}: `{error}`")
+        await status.edit(content=f"Could not generate {meme_name}: `{error}`")
     finally:
         if os.path.exists(output_path):
             os.remove(output_path)
@@ -1684,6 +1667,7 @@ async def announce(ctx, *, message):
 
 @bot.command()
 @owner_only()
+@commands.guild_only()
 async def setlog(ctx, channel: discord.TextChannel):
     data["logs"][str(ctx.guild.id)] = channel.id
     save_data()
@@ -1692,6 +1676,7 @@ async def setlog(ctx, channel: discord.TextChannel):
 
 @bot.command()
 @owner_only()
+@commands.guild_only()
 async def disablelog(ctx):
     data["logs"].pop(str(ctx.guild.id), None)
     save_data()
@@ -1753,7 +1738,6 @@ async def help_command(ctx):
     prefix = get_prefix(bot, ctx.message)
     pages = []
 
-    # Page 1: Moderation
     embed1 = discord.Embed(
         title="🛡️ Moderation Commands",
         description="ID-Restricted moderation tools for authorized staff.",
@@ -1779,7 +1763,6 @@ async def help_command(ctx):
     )
     pages.append(embed1)
 
-    # Page 2: Server & Utility
     embed2 = discord.Embed(
         title="⚙️ Server & Utility Commands",
         description="General server discovery and user profiling commands.",
@@ -1802,7 +1785,6 @@ async def help_command(ctx):
     )
     pages.append(embed2)
 
-    # Page 3: Fun Actions
     embed3 = discord.Embed(
         title="🐾 Fun & Action Commands",
         description="Interact and play with server members.",
@@ -1825,7 +1807,6 @@ async def help_command(ctx):
     )
     pages.append(embed3)
 
-    # Page 4: Memes & Quotes (All GIF format output)
     embed4 = discord.Embed(
         title="🎬 Memes & Quotes",
         description="Generate animated caption GIFs, panel GIFs, and quotes. *(All output as .gif with Impact font)*",
@@ -1848,7 +1829,6 @@ async def help_command(ctx):
     )
     pages.append(embed4)
 
-    # Page 5: Music & Audio Suite
     embed5 = discord.Embed(
         title="🎵 Music & Audio Suite",
         description="Interactive music playback, queue management, playlists, and favorites.",
@@ -1887,19 +1867,19 @@ async def help_command(ctx):
     )
     pages.append(embed5)
 
-    # Page 6: AI Chat & Developer Tools
     embed6 = discord.Embed(
-        title="🛠️ AI Chat & Developer Tools",
-        description="AI generation, logging options, auto-replies, and isolated testing.",
+        title="🛠️ Config & Developer Tools",
+        description="Logging options, auto-replies, and isolated dev testing.",
         color=discord.Color.dark_gray()
     )
     embed6.add_field(
         name="Commands",
         value=(
-            f"`{prefix}chat <message>` — Chat with the local AI\n"
-            f"`{prefix}persona <name>` — Change the AI's current personality\n"
-            f"`{prefix}clearchat` — Wipe your short-term memory with the AI\n"
+            f"`{prefix}chat <msg>` — Chat with the local AI\n"
+            f"`{prefix}persona <name>` — Change AI personality\n"
             f"`{prefix}restart` — Reboot the bot (Owner only)\n"
+            f"`{prefix}disable <cmd> [--global]` — Disable command (Owner only)\n"
+            f"`{prefix}enable <cmd> [--global]` — Enable command (Owner only)\n"
             f"`{prefix}blacklist` — Manage user blacklists (Owner only)\n"
             f"`{prefix}setlog #channel` — Set logging destination\n"
             f"`{prefix}disablelog` — Disable logging\n"
@@ -1919,6 +1899,74 @@ async def help_command(ctx):
 
 
 # ============================================================
+# BOT DISABLING / ENABLING CONFIGURATION
+# ============================================================
+
+@bot.command()
+@owner_only()
+async def disable(ctx, cmd_name: str, *, flag: str = ""):
+    cmd = bot.get_command(cmd_name)
+    if not cmd:
+        await ctx.send(f"Command `{cmd_name}` not found! {EMOJI_BOYKISSER_HUH}")
+        return
+    
+    real_name = cmd.name
+    if real_name in ["enable", "disable", "restart", "help"]:
+        await ctx.send(f"You cannot disable the `{real_name}` command! That's a bad idea. {EMOJI_SHOCKED}")
+        return
+
+    is_global = "--global" in flag.lower()
+    disabled = data.setdefault("disabled_commands", {"global": [], "guilds": {}})
+
+    if is_global:
+        if real_name not in disabled["global"]:
+            disabled["global"].append(real_name)
+            save_data()
+            await ctx.send(f"🚫 Command `{real_name}` has been disabled **globally**.")
+        else:
+            await ctx.send(f"Command `{real_name}` is already disabled globally.")
+    else:
+        guild_id = str(ctx.guild.id)
+        g_disabled = disabled["guilds"].setdefault(guild_id, [])
+        if real_name not in g_disabled:
+            g_disabled.append(real_name)
+            save_data()
+            await ctx.send(f"🚫 Command `{real_name}` has been disabled **in this server**.")
+        else:
+            await ctx.send(f"Command `{real_name}` is already disabled in this server.")
+
+
+@bot.command()
+@owner_only()
+async def enable(ctx, cmd_name: str, *, flag: str = ""):
+    cmd = bot.get_command(cmd_name)
+    if not cmd:
+        await ctx.send(f"Command `{cmd_name}` not found! {EMOJI_BOYKISSER_HUH}")
+        return
+    
+    real_name = cmd.name
+    is_global = "--global" in flag.lower()
+    disabled = data.setdefault("disabled_commands", {"global": [], "guilds": {}})
+
+    if is_global:
+        if real_name in disabled["global"]:
+            disabled["global"].remove(real_name)
+            save_data()
+            await ctx.send(f"✅ Command `{real_name}` has been enabled **globally**.")
+        else:
+            await ctx.send(f"Command `{real_name}` is not globally disabled.")
+    else:
+        guild_id = str(ctx.guild.id)
+        g_disabled = disabled["guilds"].get(guild_id, [])
+        if real_name in g_disabled:
+            g_disabled.remove(real_name)
+            save_data()
+            await ctx.send(f"✅ Command `{real_name}` has been enabled **in this server**.")
+        else:
+            await ctx.send(f"Command `{real_name}` is not disabled in this server.")
+
+
+# ============================================================
 # BOT BLACKLIST CONFIGURATION
 # ============================================================
 
@@ -1929,8 +1977,8 @@ async def blacklist(ctx):
     embed = discord.Embed(
         title="🚫 Blacklist Configuration",
         description=(
-            f"`{prefix}blacklist add @user` — Block a user from using the bot\n"
-            f"`{prefix}blacklist remove @user` — Unblock a user\n"
+            f"`{prefix}blacklist add @user [command]` — Block a user from using all or specific commands\n"
+            f"`{prefix}blacklist remove @user [command]` — Unblock a user\n"
             f"`{prefix}blacklist list` — View all blacklisted users"
         ),
         color=discord.Color.red()
@@ -1940,55 +1988,82 @@ async def blacklist(ctx):
 
 @blacklist.command(name="add")
 @owner_only()
-async def blacklist_add(ctx, user: discord.User):
+async def blacklist_add(ctx, user: discord.User, cmd_name: str = None):
     if user.id in OWNER_IDS:
         await ctx.send("You cannot blacklist an owner!")
         return
 
-    if "blacklist" not in data:
-        data["blacklist"] = []
+    bl = data.setdefault("blacklist", {"all": []})
 
-    if user.id in data["blacklist"]:
-        await ctx.send(f"**{user.name}** is already blacklisted.")
-        return
-
-    data["blacklist"].append(user.id)
-    save_data()
-    await ctx.send(f"Added **{user.name}** to the blacklist. They can no longer use commands.")
+    if not cmd_name:
+        if user.id in bl["all"]:
+            await ctx.send(f"**{user.name}** is already fully blacklisted.")
+        else:
+            bl["all"].append(user.id)
+            save_data()
+            await ctx.send(f"Added **{user.name}** to the total blacklist. They can no longer use any commands.")
+    else:
+        cmd = bot.get_command(cmd_name)
+        if not cmd:
+            await ctx.send(f"Command `{cmd_name}` not found! {EMOJI_BOYKISSER_HUH}")
+            return
+        real_name = cmd.name
+        c_list = bl.setdefault(real_name, [])
+        if user.id in c_list:
+            await ctx.send(f"**{user.name}** is already blacklisted from `{real_name}`.")
+        else:
+            c_list.append(user.id)
+            save_data()
+            await ctx.send(f"Added **{user.name}** to the blacklist specifically for the `{real_name}` command.")
 
 
 @blacklist.command(name="remove")
 @owner_only()
-async def blacklist_remove(ctx, user: discord.User):
-    if "blacklist" not in data or user.id not in data["blacklist"]:
-        await ctx.send(f"**{user.name}** is not in the blacklist.")
-        return
+async def blacklist_remove(ctx, user: discord.User, cmd_name: str = None):
+    bl = data.setdefault("blacklist", {"all": []})
 
-    data["blacklist"].remove(user.id)
-    save_data()
-    await ctx.send(f"Removed **{user.name}** from the blacklist.")
+    if not cmd_name:
+        if user.id in bl["all"]:
+            bl["all"].remove(user.id)
+            save_data()
+            await ctx.send(f"Removed **{user.name}** from the total blacklist.")
+        else:
+            await ctx.send(f"**{user.name}** is not in the total blacklist.")
+    else:
+        cmd = bot.get_command(cmd_name)
+        if not cmd:
+            real_name = cmd_name
+        else:
+            real_name = cmd.name
+
+        c_list = bl.get(real_name, [])
+        if user.id in c_list:
+            c_list.remove(user.id)
+            if not c_list:
+                del bl[real_name]
+            save_data()
+            await ctx.send(f"Removed **{user.name}** from the `{real_name}` blacklist.")
+        else:
+            await ctx.send(f"**{user.name}** is not blacklisted from `{real_name}`.")
 
 
 @blacklist.command(name="list")
 @owner_only()
 async def blacklist_list(ctx):
-    if "blacklist" not in data or not data["blacklist"]:
+    bl = data.get("blacklist", {"all": []})
+    if not bl or (not bl.get("all") and all(not v for v in bl.values())):
         await ctx.send("The blacklist is currently empty.")
         return
 
-    users = []
-    for user_id in data["blacklist"]:
-        user = bot.get_user(user_id)
-        if user:
-            users.append(f"• {user.name} (`{user_id}`)")
-        else:
-            users.append(f"• Unknown User (`{user_id}`)")
+    embed = discord.Embed(title="🚫 Blacklisted Users", color=discord.Color.red())
 
-    embed = discord.Embed(
-        title="🚫 Blacklisted Users",
-        description="\n".join(users),
-        color=discord.Color.red()
-    )
+    if bl.get("all"):
+        embed.add_field(name="Full Blacklist (All Commands)", value="\n".join(f"• <@{uid}> (`{uid}`)" for uid in bl["all"]), inline=False)
+
+    for cmd_key, uids in bl.items():
+        if cmd_key != "all" and uids:
+            embed.add_field(name=f"Command: {cmd_key}", value="\n".join(f"• <@{uid}>" for uid in uids), inline=False)
+
     await ctx.send(embed=embed)
 
 
@@ -2838,6 +2913,16 @@ async def on_command_error(ctx, error):
 
         if "OWNER_ONLY" in err_msg:
             await ctx.send("Only the bot developer is authorized to run this command.")
+            return
+
+        if "DISABLED_GLOBAL:" in err_msg:
+            cmd = err_msg.split("DISABLED_GLOBAL:")[1].strip()
+            await ctx.send(f"The `{cmd}` command has been temporarily disabled globally by the developer. {EMOJI_SHOCKED}")
+            return
+
+        if "DISABLED_SERVER:" in err_msg:
+            cmd = err_msg.split("DISABLED_SERVER:")[1].strip()
+            await ctx.send(f"The `{cmd}` command is currently disabled in this server. {EMOJI_SHOCKED}")
             return
 
         if "DEVTEST_LOCKED:" in err_msg:
