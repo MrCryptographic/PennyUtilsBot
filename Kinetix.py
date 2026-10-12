@@ -13,6 +13,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageSequence
 import textwrap
 from dotenv import load_dotenv
 
+# Import our new modular AI Chat file
+import ai_chat
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -20,7 +23,7 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================
 
-BOT_VERSION = "2.5.0"
+BOT_VERSION = "2.7.0"
 TOKEN = os.getenv("TOKEN")
 
 # Default command prefix
@@ -80,6 +83,8 @@ def load_data():
         "warnings": {},
         "logs": {},
         "devtest": {},
+        "blacklist": [],
+        "personas": {}, # Stores user -> persona preference
         "auto_replies": [
             f"Oh, look who it is! {EMOJI_SMIRK}",
             f"H-hey! {EMOJI_SHY}",
@@ -168,7 +173,6 @@ def get_prefix(bot, message):
 
 
 def sanitize_markdown(text: str, max_len: int = 50) -> str:
-    """Cleans up markdown characters and caps length to prevent embed overflows."""
     if not text:
         return "Unknown Track"
     cleaned = text.replace("[", "(").replace("]", ")").replace("\n", " ").strip()
@@ -178,7 +182,6 @@ def sanitize_markdown(text: str, max_len: int = 50) -> str:
 
 
 def get_meme_font(size: int, script_dir: str):
-    """Loads impact.ttf from the script folder, with Windows system font fallbacks."""
     candidates = [
         os.path.join(script_dir, "impact.ttf"),
         os.path.join(script_dir, "Impact.ttf"),
@@ -212,6 +215,7 @@ bot = commands.Bot(
 )
 
 last_reply_time = {}
+user_spam_tracker = {}
 
 
 # ============================================================
@@ -237,9 +241,60 @@ def moderator_only():
 def owner_only():
     async def predicate(ctx):
         if not is_owner(ctx.author.id):
-            raise commands.CheckFailure("You are not authorized to change bot configuration.")
+            raise commands.CheckFailure("OWNER_ONLY")
         return True
     return commands.check(predicate)
+
+
+@bot.check
+async def blacklist_check(ctx):
+    if ctx.author.id in data.get("blacklist", []):
+        raise commands.CheckFailure("BLACKLISTED")
+    return True
+
+
+@bot.check
+async def anti_spam_check(ctx):
+    if is_moderator(ctx.author.id):
+        return True
+
+    if not ctx.guild:
+        return True
+
+    now = datetime.now()
+    user_id = ctx.author.id
+    SPAM_COOLDOWN = 3.0 # Allow 1 command every 3 seconds
+
+    if user_id not in user_spam_tracker:
+        user_spam_tracker[user_id] = {"last_cmd": now, "warnings": 0}
+        return True
+
+    tracker = user_spam_tracker[user_id]
+    time_diff = (now - tracker["last_cmd"]).total_seconds()
+
+    if time_diff < SPAM_COOLDOWN:
+        tracker["warnings"] += 1
+        tracker["last_cmd"] = now
+
+        if tracker["warnings"] >= 3:
+            tracker["warnings"] = 0
+            if ctx.guild.me.guild_permissions.moderate_members and ctx.author.top_role < ctx.guild.me.top_role:
+                until = discord.utils.utcnow() + timedelta(minutes=1)
+                try:
+                    await ctx.author.timeout(until, reason="Command spamming")
+                    await ctx.send(f"⏳ {ctx.author.mention} has been timed out for 1 minute due to command spamming.")
+                except Exception:
+                    pass
+            else:
+                await ctx.send(f"⚠️ {ctx.author.mention}, you have hit the spam threshold! Slow down.", delete_after=5)
+            raise commands.CheckFailure("SPAMMING")
+        else:
+            await ctx.send(f"⚠️ {ctx.author.mention}, you're using commands too fast! Slow down. ({tracker['warnings']}/3 warnings)", delete_after=5)
+            raise commands.CheckFailure("SPAMMING")
+    else:
+        tracker["last_cmd"] = now
+        tracker["warnings"] = max(0, tracker["warnings"] - 1)
+        return True
 
 
 @bot.check
@@ -281,6 +336,74 @@ async def log_action(guild, message):
             await channel.send(message)
         except discord.HTTPException:
             pass
+
+
+# ============================================================
+# AI CHATBOT SYSTEM (LM STUDIO INTEGRATION)
+# ============================================================
+
+# Short-term memory for users to keep context
+user_chat_history = {}
+
+@bot.command()
+async def persona(ctx, name: str = None):
+    if not name:
+        available = ", ".join([f"`{p}`" for p in ai_chat.PERSONALITIES.keys()])
+        await ctx.send(
+            f"**Available AI Personas:** {available}\n"
+            f"**Usage:** `{get_prefix(bot, ctx.message)}persona <name>`"
+        )
+        return
+
+    name = name.lower()
+    if name not in ai_chat.PERSONALITIES:
+        await ctx.send(f"Unknown persona! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    # Update persona
+    data["personas"][str(ctx.author.id)] = name
+    save_data()
+    
+    # Wipe their short-term memory so the old persona doesn't bleed into the new one
+    user_chat_history.pop(ctx.author.id, None)
+    
+    await ctx.send(f"Your AI persona has been updated to **{name}**. Conversation history cleared! {EMOJI_BLUSH}")
+
+@bot.command()
+async def clearchat(ctx):
+    user_chat_history.pop(ctx.author.id, None)
+    await ctx.send(f"Your chat history has been wiped! Amnesia time! {EMOJI_SHOCKED}")
+
+@bot.command(aliases=["c", "ai"])
+async def chat(ctx, *, message: str = None):
+    if not message:
+        await ctx.send(f"What do you want to say to me? {EMOJI_BOYKISSER_HUH}")
+        return
+
+    user_id = ctx.author.id
+    persona_name = data.get("personas", {}).get(str(user_id), "default")
+
+    if user_id not in user_chat_history:
+        user_chat_history[user_id] = []
+
+    # Limit history to the last 10 messages (5 turns) to save tokens/memory
+    history = user_chat_history[user_id][-10:]
+
+    async with ctx.typing():
+        # Call to the new ai_chat module
+        response = await ai_chat.generate_response(message, persona=persona_name, history=history)
+
+        # Log the conversation into their history array
+        user_chat_history[user_id].append({"role": "user", "content": message})
+        user_chat_history[user_id].append({"role": "assistant", "content": response})
+
+        # Discord 2000 character limit handler (split into chunks if it's too long)
+        if len(response) > 1990:
+            chunks = [response[i:i+1990] for i in range(0, len(response), 1990)]
+            for chunk in chunks:
+                await ctx.send(chunk)
+        else:
+            await ctx.send(response)
 
 
 # ============================================================
@@ -347,7 +470,6 @@ def get_ffmpeg_options(effect_name: str = None):
     }
 
 async def update_vc_status(channel, status_text: str = None):
-    """Updates the voice channel status line under the channel name."""
     if not channel:
         return
     try:
@@ -391,7 +513,6 @@ def cancel_disconnect(guild_id: int):
     state["disconnect_task"] = None
 
 async def resolve_stream(track_dict: dict):
-    """Extracts a valid direct audio stream URL with anti-403 headers."""
     target_url = track_dict.get('webpage_url') or track_dict.get('url')
     
     if target_url and "videoplayback" in target_url:
@@ -462,7 +583,6 @@ async def play_next_track(guild_id: int):
 
         vc.play(transformed, after=after_callback)
 
-        # Set voice channel status to the playing song
         clean_title = sanitize_markdown(track["title"], max_len=60)
         if vc.channel:
             await update_vc_status(vc.channel, f"🎶 {clean_title}")
@@ -484,7 +604,7 @@ async def play_next_track(guild_id: int):
 
 
 # ============================================================
-# INTERACTIVE MUSIC & FAVORITES VIEWS
+# INTERACTIVE MUSIC VIEWS
 # ============================================================
 
 class EffectSelectView(discord.ui.View):
@@ -762,18 +882,15 @@ class FavoritesView(discord.ui.View):
         total_pages = max(1, (len(fav_list) + items_per_page - 1) // items_per_page)
         self.page = min(self.page, total_pages - 1)
 
-        # Mode Toggle Button
         toggle_label = "Switch to My Favorites 👤" if self.mode == "guild" else "Switch to Server Favorites 🌐"
         toggle_btn = discord.ui.Button(label=toggle_label, style=discord.ButtonStyle.primary, row=0)
         toggle_btn.callback = self.toggle_mode
         self.add_item(toggle_btn)
 
-        # Play All Favs Button
         play_all_btn = discord.ui.Button(label="▶️ Play All Favs", style=discord.ButtonStyle.success, row=0, disabled=(len(fav_list) == 0))
         play_all_btn.callback = self.play_all_favs
         self.add_item(play_all_btn)
 
-        # Pagination Buttons
         prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1, disabled=(self.page <= 0))
         prev_btn.callback = self.prev_page
         self.add_item(prev_btn)
@@ -1088,6 +1205,500 @@ async def on_message(message):
 
 
 # ============================================================
+# COMMANDS ADVERTISED BY HELP
+# ============================================================
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send("I cannot kick this user because their highest role is equal to or higher than mine.")
+        return
+
+    await member.kick(reason=reason)
+    await ctx.send(f"**{member}** was kicked.\nReason: {reason}")
+    await log_action(
+        ctx.guild,
+        f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
+    )
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send("I cannot ban this user because their highest role is equal to or higher than mine.")
+        return
+
+    await member.ban(reason=reason)
+    await ctx.send(f"**{member}** was banned.\nReason: {reason}")
+    await log_action(
+        ctx.guild,
+        f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
+    )
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(ban_members=True)
+async def unban(ctx, user_id: int):
+    user = await bot.fetch_user(user_id)
+    try:
+        await ctx.guild.unban(user)
+    except discord.NotFound:
+        await ctx.send("That user is not banned.")
+        return
+
+    await ctx.send(f"**{user}** was unbanned.")
+    await log_action(
+        ctx.guild,
+        f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}"
+    )
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(moderate_members=True)
+async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
+    if minutes <= 0:
+        await ctx.send("The timeout duration must be greater than 0.")
+        return
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send("I cannot timeout this user because their role is equal to or higher than mine.")
+        return
+
+    until = discord.utils.utcnow() + timedelta(minutes=minutes)
+    await member.timeout(until, reason=reason)
+    await ctx.send(f"**{member}** was timed out for `{minutes}` minute(s).\nReason: {reason}")
+    await log_action(
+        ctx.guild,
+        f"⏱️ **Timeout**\nUser: {member} ({member.id})\nDuration: {minutes} minutes\n"
+        f"Moderator: {ctx.author}\nReason: {reason}"
+    )
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(moderate_members=True)
+async def untimeout(ctx, member: discord.Member):
+    await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
+    await ctx.send(f"Timeout removed from **{member}**.")
+
+
+@bot.command()
+@moderator_only()
+async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
+    guild_id = str(ctx.guild.id)
+    user_id = str(member.id)
+    warnings = data.setdefault("warnings", {}).setdefault(guild_id, {}).setdefault(user_id, [])
+    warnings.append({"reason": reason, "moderator": ctx.author.id})
+    save_data()
+
+    await ctx.send(f"⚠️ **{member}** has been warned.\nReason: {reason}\nTotal warnings: `{len(warnings)}`")
+    await log_action(
+        ctx.guild,
+        f"⚠️ **Warning**\nUser: {member} ({member.id})\nModerator: {ctx.author}\n"
+        f"Reason: {reason}\nTotal warnings: {len(warnings)}"
+    )
+
+
+@bot.command()
+@moderator_only()
+async def warnings(ctx, member: discord.Member):
+    entries = data.get("warnings", {}).get(str(ctx.guild.id), {}).get(str(member.id), [])
+    if not entries:
+        await ctx.send(f"**{member}** has no warnings.")
+        return
+
+    embed = discord.Embed(title=f"Warnings — {member}", color=discord.Color.orange())
+    for index, entry in enumerate(entries, 1):
+        moderator = ctx.guild.get_member(entry["moderator"])
+        moderator_name = str(moderator) if moderator else str(entry["moderator"])
+        embed.add_field(
+            name=f"Warning #{index}",
+            value=f"Reason: {entry['reason']}\nModerator: {moderator_name}",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@moderator_only()
+async def clearwarnings(ctx, member: discord.Member):
+    data.get("warnings", {}).get(str(ctx.guild.id), {}).pop(str(member.id), None)
+    save_data()
+    await ctx.send(f"Cleared all warnings for **{member}**.")
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_messages=True)
+async def purge(ctx, amount: int):
+    if amount <= 0:
+        await ctx.send("Amount must be greater than 0.")
+        return
+
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    confirmation = await ctx.send(f"Deleted `{len(deleted) - 1}` message(s).")
+    await confirmation.delete(delay=3)
+    await log_action(ctx.guild, f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {len(deleted) - 1}")
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_channels=True)
+async def slowmode(ctx, seconds: int):
+    if not 0 <= seconds <= 21600:
+        await ctx.send("Slowmode must be between 0 and 21600 seconds.")
+        return
+    await ctx.channel.edit(slowmode_delay=seconds)
+    await ctx.send(f"Slowmode set to `{seconds}` second(s).")
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_channels=True)
+async def lock(ctx):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = False
+    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+    await ctx.send("🔒 Channel locked.")
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_channels=True)
+async def unlock(ctx):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = None
+    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+    await ctx.send("🔓 Channel unlocked.")
+
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_nicknames=True)
+async def nick(ctx, member: discord.Member, *, nickname=None):
+    await member.edit(nick=nickname, reason=f"Nickname changed by {ctx.author}")
+    if nickname:
+        await ctx.send(f"Nickname changed for **{member}** to `{nickname}`.")
+    else:
+        await ctx.send(f"Nickname reset for **{member}**.")
+
+
+@bot.command()
+async def serverinfo(ctx):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    guild = ctx.guild
+    embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
+    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>")
+    embed.add_field(name="Members", value=guild.member_count)
+    embed.add_field(name="Channels", value=len(guild.channels))
+    embed.add_field(name="Roles", value=len(guild.roles))
+    embed.add_field(name="Server ID", value=guild.id)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def userinfo(ctx, member: discord.Member = None):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    member = member or ctx.author
+    embed = discord.Embed(title=str(member), color=member.color)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Username", value=str(member))
+    embed.add_field(name="ID", value=member.id)
+    embed.add_field(
+        name="Joined Server",
+        value=discord.utils.format_dt(member.joined_at, "F") if member.joined_at else "Unknown"
+    )
+    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "F"))
+    embed.add_field(name="Top Role", value=member.top_role.mention)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def avatar(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"{member}'s Avatar", color=member.color)
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def banner(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    try:
+        user = await bot.fetch_user(member.id)
+    except discord.HTTPException:
+        await ctx.send("Unable to fetch user profile.")
+        return
+    if not user.banner:
+        await ctx.send(f"**{user}** does not have a dynamic banner configured.")
+        return
+
+    embed = discord.Embed(title=f"{user}'s Banner", color=member.color)
+    embed.set_image(url=user.banner.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def furry(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    percentage = random.Random(member.id).randint(0, 100)
+    if percentage < 30:
+        message = f"{member.mention} is only **{percentage}%** furry! {EMOJI_SHOCKED}"
+    elif percentage < 75:
+        message = f"{member.mention} is **{percentage}%** furry! {EMOJI_SMIRK}"
+    else:
+        message = f"Oh my! {member.mention} is **{percentage}%** furry! {EMOJI_LOVE} {EMOJI_BLUSH}"
+    await ctx.send(message)
+
+
+@bot.command(aliases=["match"])
+async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
+    if user2 is None:
+        user1, user2 = ctx.author, user1
+    if user1 == user2:
+        await ctx.send(f"You can't ship someone with themselves! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    combined_ids = "".join(sorted((str(user1.id), str(user2.id))))
+    percentage = random.Random(combined_ids).randint(0, 100)
+    if percentage < 25:
+        message = f"💔 **{percentage}%**... Yikes, {user1.mention} and {user2.mention} might want to stay just friends. {EMOJI_SHOCKED}"
+    elif percentage < 75:
+        message = f"💛 **{percentage}%**! {user1.mention} and {user2.mention} have some decent chemistry! {EMOJI_SMIRK}"
+    else:
+        message = f"💖 **{percentage}%**!!! {user1.mention} and {user2.mention} are a perfect match! {EMOJI_LOVE} {EMOJI_BLUSH}"
+    await ctx.send(message)
+
+
+@bot.command()
+async def femboy(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    percentage = random.Random(member.id).randint(0, 100)
+    if percentage < 30:
+        message = f"{member.mention} is only **{percentage}%** femboy! {EMOJI_SHOCKED}"
+    elif percentage < 75:
+        message = f"{member.mention} is **{percentage}%** femboy! {EMOJI_SMIRK}"
+    else:
+        message = f"Oh my! {member.mention} is **{percentage}%** femboy! {EMOJI_LOVE} {EMOJI_BLUSH}"
+    await ctx.send(message)
+
+
+@bot.command()
+async def kiss(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send(f"Please mention someone to kiss! {EMOJI_BOYKISSER_HUH}")
+    elif member == ctx.author:
+        await ctx.send(f"You can't kiss yourself! But here is some love: {EMOJI_SHY}")
+    else:
+        await ctx.send(f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}")
+
+
+@bot.command()
+async def hug(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send(f"Please mention someone to hug! {EMOJI_BOYKISSER_HUH}")
+    elif member == ctx.author:
+        await ctx.send(f"Self hugs are okay, but here is a big embrace from me! {EMOJI_SHY} {EMOJI_LOVE}")
+    else:
+        await ctx.send(f"{ctx.author.mention} gives {member.mention} a warm, comfortable hug! {EMOJI_LOVE} {EMOJI_BLUSH}")
+
+
+@bot.command()
+async def punch(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send(f"Please mention someone to punch! {EMOJI_BOYKISSER_HUH}")
+    elif member == ctx.author:
+        await ctx.send(f"Punching yourself? Don't do that! {EMOJI_BOYKISSER_HUH}")
+    else:
+        await ctx.send(f"{ctx.author.mention} punches {member.mention} straight in the face! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}")
+
+
+@bot.command()
+async def attack(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send(f"Please mention someone to attack! {EMOJI_BOYKISSER_HUH}")
+    elif member == ctx.author:
+        await ctx.send(f"Why are you trying to attack yourself? {EMOJI_BOYKISSER_HUH}")
+    else:
+        attacks = [
+            f"{ctx.author.mention} charges directly at {member.mention} with a legendary tackle! {EMOJI_BOYKISSER_RIGHT}",
+            f"{ctx.author.mention} attempts to attack {member.mention} with a pillow! {EMOJI_BOYKISSER_HAPPY}",
+            f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
+        ]
+        await ctx.send(random.choice(attacks))
+
+
+@bot.command()
+async def boop(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send(f"Please mention someone to boop! {EMOJI_BOYKISSER_HUH}")
+    elif member == ctx.author:
+        await ctx.send(f"You boop your own nose. Cute! {EMOJI_BOYKISSER_BOOP}")
+    else:
+        await ctx.send(f"{ctx.author.mention} walks up and gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}")
+
+
+@bot.command()
+async def dance(ctx, member: discord.Member = None):
+    if member:
+        message = f"{ctx.author.mention} and {member.mention} start bustin' it down on the dance floor! {EMOJI_DANCING}"
+    else:
+        message = f"{ctx.author.mention} breaks into an energetic dance routine! {EMOJI_DANCING}"
+    await ctx.send(message)
+
+
+async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: str):
+    if not text or not text.strip():
+        await ctx.send(f"Please provide some text for {meme_name}! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_names = [filename_base]
+    if filename_base == "basketball.gif":
+        candidate_names.extend([
+            "basketball.png", "basketball.jpg", "basketball.jpeg",
+            "yaoming.gif", "yaoming.png", "yaoming.jpg", "yaoming.jpeg"
+        ])
+
+    asset_path = next(
+        (
+            candidate
+            for name in candidate_names
+            for candidate in (
+                os.path.join(script_dir, "assets", name),
+                os.path.join(script_dir, name)
+            )
+            if os.path.isfile(candidate)
+        ),
+        None
+    )
+    if asset_path is None:
+        await ctx.send(
+            f"**Error:** `{filename_base}` was not found. Add the meme template to the `assets` folder "
+            "or the bot's root folder."
+        )
+        return
+
+    status_msg = await ctx.send(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
+    output_path = os.path.join(script_dir, f"{os.path.splitext(filename_base)[0]}_{ctx.message.id}.gif")
+    try:
+        with Image.open(asset_path) as image:
+            font = get_meme_font(28, script_dir)
+            chars_per_line = max(10, int((image.width - 24) / max(1, font.getlength("A"))))
+            lines = textwrap.wrap(text.strip(), width=chars_per_line) or [text.strip()]
+            line_height = 35
+            caption_height = len(lines) * line_height + 24
+            frames = []
+
+            for frame in ImageSequence.Iterator(image):
+                canvas = Image.new("RGBA", (image.width, image.height + caption_height), "white")
+                canvas.paste(frame.convert("RGBA"), (0, caption_height))
+                draw = ImageDraw.Draw(canvas)
+                y = (caption_height - len(lines) * line_height) // 2
+                for line in lines:
+                    line_width = font.getlength(line)
+                    draw.text(((image.width - line_width) // 2, y), line, fill="black", font=font)
+                    y += line_height
+                frames.append(canvas.convert("RGB"))
+
+            if not frames:
+                raise ValueError(f"{filename_base} contains no image frames")
+            frames[0].save(
+                output_path,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                duration=image.info.get("duration") or 50,
+                loop=image.info.get("loop", 0)
+            )
+
+        await ctx.send(file=discord.File(output_path))
+        await status_msg.delete()
+    except (OSError, ValueError, discord.HTTPException) as error:
+        await status_msg.edit(content=f"Could not generate {meme_name}: `{error}`")
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+@bot.command()
+async def jarvis(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "jarvis.gif", "Jarvis", text)
+
+
+@bot.command()
+async def lowtiergod(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "lowtiergod.gif", "Low Tier God", text)
+
+
+@bot.command(aliases=["floating", "ascend", "sponge"])
+async def spongebob(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "spongebob.gif", "Spongebob Floating", text)
+
+
+@bot.command(aliases=["tuff", "hoodiebob", "sadbob"])
+async def tuffbob(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "tuffbob.gif", "Tuff Spongebob", text)
+
+
+@bot.command(aliases=["fanum", "food"])
+async def fanumfood(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "fanumfood.gif", "Fanum Food", text)
+
+
+@bot.command(aliases=["pilot", "crossview"])
+async def stephen(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "stephen.jpg", "Stephen", text)
+
+
+@bot.command(aliases=["reason", "heartbeats"])
+async def katanaman(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "reason.gif", "Katana Man", text)
+
+
+@bot.command(aliases=["yaoming", "cried"])
+async def basketball(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "basketball.gif", "Basketball", text)
+
+
+@bot.command()
+@moderator_only()
+async def announce(ctx, *, message):
+    embed = discord.Embed(title="Announcement", description=message, color=discord.Color.blurple())
+    embed.set_footer(text=f"Posted by {ctx.author}")
+    await ctx.send("@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
+
+
+@bot.command()
+@owner_only()
+async def setlog(ctx, channel: discord.TextChannel):
+    data["logs"][str(ctx.guild.id)] = channel.id
+    save_data()
+    await ctx.send(f"Moderation logs will now be sent to {channel.mention}.")
+
+
+@bot.command()
+@owner_only()
+async def disablelog(ctx):
+    data["logs"].pop(str(ctx.guild.id), None)
+    save_data()
+    await ctx.send("Moderation logging disabled.")
+
+
+# ============================================================
 # PAGINATED HELP SYSTEM (UI BUTTONS)
 # ============================================================
 
@@ -1208,10 +1819,7 @@ async def help_command(ctx):
             f"`{prefix}punch @user` — Punch someone\n"
             f"`{prefix}attack @user` — Perform an attack on someone\n"
             f"`{prefix}boop @user` — Gently boop a member's nose\n"
-            f"`{prefix}dance [@user]` — Dance alone or with a partner\n"
-            f"`{prefix}furry [@user]` — Check how furry someone is\n"
-            f"`{prefix}femboy [@user]` — Check how femboy someone is\n"
-            f"`{prefix}ship @user1 [@user2]` — Calculate the ship chemistry between two users"
+            f"`{prefix}dance [@user]` — Dance alone or with a partner"
         ),
         inline=False
     )
@@ -1229,12 +1837,12 @@ async def help_command(ctx):
             f"`{prefix}jarvis <text>` — Caption the Jarvis explanation GIF\n"
             f"`{prefix}lowtiergod <text>` — Caption the Low Tier God GIF\n"
             f"`{prefix}spongebob <text>` — Caption Spongebob floating to music\n"
+            f"`{prefix}tuffbob <text>` — Caption the Tuff Spongebob GIF\n"
             f"`{prefix}fanumfood <text>` — Caption the Fanum Food GIF\n"
             f"`{prefix}stephen <text>` — Caption the Stephen meme\n"
             f"`{prefix}katanaman <text>` — Fill the Katana Man manga panel\n"
             f"`{prefix}basketball <text>` — Yao Ming meme with any custom text\n"
-            f"`{prefix}quotethis` — Reply to a message with this command to quote it!\n"
-            f"`{prefix}tuffbob <text>` — Caption the Tuff Spongebob GIF"
+            f"`{prefix}quotethis` — Reply to a message with this command to quote it!"
         ),
         inline=False
     )
@@ -1279,19 +1887,22 @@ async def help_command(ctx):
     )
     pages.append(embed5)
 
-    # Page 6: Config & Developer
+    # Page 6: AI Chat & Developer Tools
     embed6 = discord.Embed(
-        title="🛠️ Config & Developer Tools",
-        description="Logging options, auto-replies, and isolated dev testing.",
+        title="🛠️ AI Chat & Developer Tools",
+        description="AI generation, logging options, auto-replies, and isolated testing.",
         color=discord.Color.dark_gray()
     )
     embed6.add_field(
         name="Commands",
         value=(
+            f"`{prefix}chat <message>` — Chat with the local AI\n"
+            f"`{prefix}persona <name>` — Change the AI's current personality\n"
+            f"`{prefix}clearchat` — Wipe your short-term memory with the AI\n"
             f"`{prefix}restart` — Reboot the bot (Owner only)\n"
+            f"`{prefix}blacklist` — Manage user blacklists (Owner only)\n"
             f"`{prefix}setlog #channel` — Set logging destination\n"
             f"`{prefix}disablelog` — Disable logging\n"
-            f"`{prefix}autoreply` — Configure auto replies *(Disabled - Getting a rework soon)*\n"
             f"`{prefix}devtest` — Lock Kinetix into a temporary test channel\n"
             f"`{prefix}undevtest` — Delete test room and unlock bot activity"
         ),
@@ -1305,6 +1916,80 @@ async def help_command(ctx):
 
     view = HelpPaginator(ctx.author, pages)
     view.message = await ctx.send(embed=pages[0], view=view)
+
+
+# ============================================================
+# BOT BLACKLIST CONFIGURATION
+# ============================================================
+
+@bot.group(invoke_without_command=True)
+@owner_only()
+async def blacklist(ctx):
+    prefix = get_prefix(bot, ctx.message)
+    embed = discord.Embed(
+        title="🚫 Blacklist Configuration",
+        description=(
+            f"`{prefix}blacklist add @user` — Block a user from using the bot\n"
+            f"`{prefix}blacklist remove @user` — Unblock a user\n"
+            f"`{prefix}blacklist list` — View all blacklisted users"
+        ),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+
+
+@blacklist.command(name="add")
+@owner_only()
+async def blacklist_add(ctx, user: discord.User):
+    if user.id in OWNER_IDS:
+        await ctx.send("You cannot blacklist an owner!")
+        return
+
+    if "blacklist" not in data:
+        data["blacklist"] = []
+
+    if user.id in data["blacklist"]:
+        await ctx.send(f"**{user.name}** is already blacklisted.")
+        return
+
+    data["blacklist"].append(user.id)
+    save_data()
+    await ctx.send(f"Added **{user.name}** to the blacklist. They can no longer use commands.")
+
+
+@blacklist.command(name="remove")
+@owner_only()
+async def blacklist_remove(ctx, user: discord.User):
+    if "blacklist" not in data or user.id not in data["blacklist"]:
+        await ctx.send(f"**{user.name}** is not in the blacklist.")
+        return
+
+    data["blacklist"].remove(user.id)
+    save_data()
+    await ctx.send(f"Removed **{user.name}** from the blacklist.")
+
+
+@blacklist.command(name="list")
+@owner_only()
+async def blacklist_list(ctx):
+    if "blacklist" not in data or not data["blacklist"]:
+        await ctx.send("The blacklist is currently empty.")
+        return
+
+    users = []
+    for user_id in data["blacklist"]:
+        user = bot.get_user(user_id)
+        if user:
+            users.append(f"• {user.name} (`{user_id}`)")
+        else:
+            users.append(f"• Unknown User (`{user_id}`)")
+
+    embed = discord.Embed(
+        title="🚫 Blacklisted Users",
+        description="\n".join(users),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
 
 
 # ============================================================
@@ -1601,7 +2286,7 @@ async def favorite(ctx, *, query: str = None):
         loop = asyncio.get_event_loop()
         try:
             def _extract():
-                with yt_dlp.YoutubeDL({'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}) as ydl:
+                with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
                     return ydl.extract_info(query, download=False)
             data_info = await loop.run_in_executor(None, _extract)
             if 'entries' in data_info and data_info['entries']:
@@ -2134,833 +2819,6 @@ async def prefix(ctx, new_prefix=None):
 
 
 # ============================================================
-# MODERATION
-# ============================================================
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(kick_members=True)
-async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
-    if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot kick this user because their highest role is equal to or higher than mine.")
-        return
-
-    await member.kick(reason=reason)
-    await ctx.send(f"**{member}** was kicked.\nReason: {reason}")
-    await log_action(
-        ctx.guild,
-        f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
-    )
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(ban_members=True)
-async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
-    if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot ban this user because their highest role is equal to or higher than mine.")
-        return
-
-    await member.ban(reason=reason)
-    await ctx.send(f"**{member}** was banned.\nReason: {reason}")
-    await log_action(
-        ctx.guild,
-        f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}"
-    )
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(ban_members=True)
-async def unban(ctx, user_id: int):
-    try:
-        user = await bot.fetch_user(user_id)
-        await ctx.guild.unban(user)
-        await ctx.send(f"**{user}** was unbanned.")
-        await log_action(
-            ctx.guild,
-            f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}"
-        )
-    except discord.NotFound:
-        await ctx.send("That user is not banned.")
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(moderate_members=True)
-async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
-    if minutes <= 0:
-        await ctx.send("The timeout duration must be greater than 0.")
-        return
-
-    if member.top_role >= ctx.guild.me.top_role:
-        await ctx.send("I cannot timeout this user because their role is equal to or higher than mine.")
-        return
-
-    until = discord.utils.utcnow() + timedelta(minutes=minutes)
-    await member.timeout(until, reason=reason)
-    await ctx.send(f"**{member}** was timed out for `{minutes}` minute(s).\nReason: {reason}")
-    await log_action(
-        ctx.guild,
-        f"⏱️ **Timeout**\nUser: {member} ({member.id})\nDuration: {minutes} minutes\nModerator: {ctx.author}\nReason: {reason}"
-    )
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(moderate_members=True)
-async def untimeout(ctx, member: discord.Member):
-    await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
-    await ctx.send(f"Timeout removed from **{member}**.")
-
-
-@bot.command()
-@moderator_only()
-async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
-    guild_id = str(ctx.guild.id)
-    user_id = str(member.id)
-
-    if guild_id not in data["warnings"]:
-        data["warnings"][guild_id] = {}
-
-    if user_id not in data["warnings"][guild_id]:
-        data["warnings"][guild_id][user_id] = []
-
-    data["warnings"][guild_id][user_id].append({
-        "reason": reason,
-        "moderator": ctx.author.id
-    })
-    save_data()
-
-    count = len(data["warnings"][guild_id][user_id])
-    await ctx.send(f"⚠️ **{member}** has been warned.\nReason: {reason}\nTotal warnings: `{count}`")
-    await log_action(
-        ctx.guild,
-        f"⚠️ **Warning**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}\nTotal warnings: {count}"
-    )
-
-
-@bot.command()
-@moderator_only()
-async def warnings(ctx, member: discord.Member):
-    guild_id = str(ctx.guild.id)
-    user_id = str(member.id)
-
-    warnings_list = data["warnings"].get(guild_id, {}).get(user_id, [])
-
-    if not warnings_list:
-        await ctx.send(f"**{member}** has no warnings.")
-        return
-
-    embed = discord.Embed(title=f"Warnings — {member}", color=discord.Color.orange())
-
-    for index, warning in enumerate(warnings_list, 1):
-        moderator = ctx.guild.get_member(warning["moderator"])
-        moderator_name = str(moderator) if moderator else str(warning["moderator"])
-        embed.add_field(
-            name=f"Warning #{index}",
-            value=f"Reason: {warning['reason']}\nModerator: {moderator_name}",
-            inline=False
-        )
-
-    await ctx.send(embed=embed)
-
-
-@bot.command()
-@moderator_only()
-async def clearwarnings(ctx, member: discord.Member):
-    guild_id = str(ctx.guild.id)
-    user_id = str(member.id)
-
-    if guild_id in data["warnings"]:
-        data["warnings"][guild_id].pop(user_id, None)
-
-    save_data()
-    await ctx.send(f"Cleared all warnings for **{member}**.")
-
-
-# ============================================================
-# PURGE / SLOWMODE / CHANNEL LOCKS
-# ============================================================
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_messages=True)
-async def purge(ctx, amount: int):
-    if amount <= 0:
-        await ctx.send("Amount must be greater than 0.")
-        return
-
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(f"Deleted `{len(deleted) - 1}` message(s).")
-    await msg.delete(delay=3)
-
-    await log_action(
-        ctx.guild,
-        f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {len(deleted) - 1}"
-    )
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_channels=True)
-async def slowmode(ctx, seconds: int):
-    if seconds < 0 or seconds > 21600:
-        await ctx.send("Slowmode must be between 0 and 21600 seconds.")
-        return
-
-    await ctx.channel.edit(slowmode_delay=seconds)
-    await ctx.send(f"Slowmode set to `{seconds}` second(s).")
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_channels=True)
-async def lock(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = False
-    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
-    await ctx.send("🔒 Channel locked.")
-
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_channels=True)
-async def unlock(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = None
-    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
-    await ctx.send("🔓 Channel unlocked.")
-
-
-# ============================================================
-# INFORMATION COMMANDS
-# ============================================================
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_nicknames=True)
-async def nick(ctx, member: discord.Member, *, nickname=None):
-    await member.edit(nick=nickname, reason=f"Nickname changed by {ctx.author}")
-    if nickname:
-        await ctx.send(f"Nickname changed for **{member}** to `{nickname}`.")
-    else:
-        await ctx.send(f"Nickname reset for **{member}**.")
-
-
-@bot.command()
-async def serverinfo(ctx):
-    guild = ctx.guild
-    embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
-    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>")
-    embed.add_field(name="Members", value=guild.member_count)
-    embed.add_field(name="Channels", value=len(guild.channels))
-    embed.add_field(name="Roles", value=len(guild.roles))
-    embed.add_field(name="Server ID", value=guild.id)
-
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    await ctx.send(embed=embed)
-
-
-@bot.command()
-async def userinfo(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    embed = discord.Embed(title=str(member), color=member.color)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Username", value=str(member))
-    embed.add_field(name="ID", value=member.id)
-    embed.add_field(
-        name="Joined Server",
-        value=discord.utils.format_dt(member.joined_at, "F") if member.joined_at else "Unknown"
-    )
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "F"))
-    embed.add_field(name="Top Role", value=member.top_role.mention)
-    await ctx.send(embed=embed)
-
-
-@bot.command()
-async def avatar(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    embed = discord.Embed(title=f"{member}'s Avatar", color=member.color)
-    embed.set_image(url=member.display_avatar.url)
-    await ctx.send(embed=embed)
-
-
-@bot.command()
-async def banner(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    try:
-        user = await bot.fetch_user(member.id)
-    except discord.HTTPException:
-        await ctx.send("Unable to fetch user data profiles.")
-        return
-
-    if not user.banner:
-        await ctx.send(f"**{user}** does not have a dynamic banner configured.")
-        return
-
-    embed = discord.Embed(title=f"{user}'s Banner", color=member.color)
-    embed.set_image(url=user.banner.url)
-    await ctx.send(embed=embed)
-
-
-# ============================================================
-# FUN ACTION COMMANDS
-# ============================================================
-
-@bot.command()
-async def furry(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    random.seed(member.id)
-    percentage = random.randint(0, 100)
-    random.seed()
-
-    if percentage < 30:
-        message = f"{member.mention} is only **{percentage}%** furry! {EMOJI_SHOCKED}"
-    elif percentage < 75:
-        message = f"{member.mention} is **{percentage}%** furry! {EMOJI_SMIRK}"
-    else:
-        message = f"Oh my! {member.mention} is **{percentage}%** furry! {EMOJI_LOVE} {EMOJI_BLUSH}"
-
-    await ctx.send(message)
-
-@bot.command(aliases=["match"])
-async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
-    # If they only mention one person, ship the author with that person
-    if user2 is None:
-        user2 = user1
-        user1 = ctx.author
-
-    if user1 == user2:
-        await ctx.send(f"You can't ship someone with themselves! {EMOJI_BOYKISSER_HUH}")
-        return
-
-    # Seed the random number generator with a sorted combination of their IDs
-    # This ensures User A + User B always results in the same ship percentage!
-    combined_ids = "".join(sorted([str(user1.id), str(user2.id)]))
-    random.seed(combined_ids)
-    percentage = random.randint(0, 100)
-    random.seed() # Reset seed
-
-    if percentage < 25:
-        msg = f"💔 **{percentage}%**... Yikes, {user1.mention} and {user2.mention} might want to stay just friends. {EMOJI_SHOCKED}"
-    elif percentage < 75:
-        msg = f"💛 **{percentage}%**! {user1.mention} and {user2.mention} have some decent chemistry! {EMOJI_SMIRK}"
-    else:
-        msg = f"💖 **{percentage}%**!!! {user1.mention} and {user2.mention} are a perfect match! {EMOJI_LOVE} {EMOJI_BLUSH}"
-
-    await ctx.send(msg)
-
-@bot.command()
-async def femboy(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    
-    # Seeds the random generator with member's ID so their rating stays consistent
-    random.seed(member.id)
-    percentage = random.randint(0, 100)
-    random.seed() # Reset seed so it doesn't affect other bot functions
-
-    if percentage < 30:
-        message = f"{member.mention} is only **{percentage}%** femboy! {EMOJI_SHOCKED}"
-    elif percentage < 75:
-        message = f"{member.mention} is **{percentage}%** femboy! {EMOJI_SMIRK}"
-    else:
-        message = f"Oh my! {member.mention} is **{percentage}%** femboy! {EMOJI_LOVE} {EMOJI_BLUSH}"
-
-    await ctx.send(message)
-
-@bot.command()
-async def kiss(ctx, member: discord.Member = None):
-    if not member:
-        await ctx.send(f"Please mention someone to kiss! {EMOJI_BOYKISSER_HUH}")
-        return
-    if member == ctx.author:
-        await ctx.send(f"You can't kiss yourself! But here is some love: {EMOJI_SHY}")
-        return
-    await ctx.send(f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}")
-
-
-@bot.command()
-async def hug(ctx, member: discord.Member = None):
-    if not member:
-        await ctx.send(f"Please mention someone to hug! {EMOJI_BOYKISSER_HUH}")
-        return
-    if member == ctx.author:
-        await ctx.send(f"Self hugs are okay, but here is a big embrace from me! {EMOJI_SHY} {EMOJI_LOVE}")
-        return
-    await ctx.send(f"{ctx.author.mention} gives {member.mention} a warm, comfortable hug! {EMOJI_LOVE} {EMOJI_BLUSH}")
-
-
-@bot.command()
-async def punch(ctx, member: discord.Member = None):
-    if not member:
-        await ctx.send(f"Please mention someone to punch! {EMOJI_BOYKISSER_HUH}")
-        return
-    if member == ctx.author:
-        await ctx.send(f"Punching yourself? Don't do that! {EMOJI_BOYKISSER_HUH}")
-        return
-    await ctx.send(f"{ctx.author.mention} punches {member.mention} straight in the face! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}")
-
-
-@bot.command()
-async def attack(ctx, member: discord.Member = None):
-    if not member:
-        await ctx.send(f"Please mention someone to attack! {EMOJI_BOYKISSER_HUH}")
-        return
-    if member == ctx.author:
-        await ctx.send(f"Why are you trying to attack yourself? {EMOJI_BOYKISSER_HUH}")
-        return
-    attacks = [
-        f"{ctx.author.mention} charges directly at {member.mention} with a legendary tackle! {EMOJI_BOYKISSER_RIGHT}",
-        f"{ctx.author.mention} attempts to attack {member.mention} with a pillow! {EMOJI_BOYKISSER_HAPPY}",
-        f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
-    ]
-    await ctx.send(random.choice(attacks))
-
-
-@bot.command()
-async def boop(ctx, member: discord.Member = None):
-    if not member:
-        await ctx.send(f"Please mention someone to boop! {EMOJI_BOYKISSER_HUH}")
-        return
-    if member == ctx.author:
-        await ctx.send(f"You boop your own nose. Cute! {EMOJI_BOYKISSER_BOOP}")
-        return
-    await ctx.send(f"{ctx.author.mention} walks up and gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}")
-
-
-@bot.command()
-async def dance(ctx, member: discord.Member = None):
-    if member:
-        await ctx.send(f"{ctx.author.mention} and {member.mention} start bustin' it down on the dance floor! {EMOJI_DANCING}")
-    else:
-        await ctx.send(f"{ctx.author.mention} breaks into an energetic dance routine! {EMOJI_DANCING}")
-
-
-# ============================================================
-# MEME ENGINES: ALL OUTPUT AS .GIF WITH IMPACT FONT & CENTERED TEXT
-# ============================================================
-
-async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: str):
-    if not text:
-        await ctx.send(f"Please provide some text for {meme_name}! {EMOJI_BOYKISSER_HUH}")
-        return
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    gif_path = os.path.join(script_dir, "assets", filename_base)
-    fallback_path_1 = os.path.join(script_dir, filename_base)
-    fallback_path_2 = os.path.join("assets", filename_base)
-    fallback_path_3 = filename_base
-
-    if not os.path.exists(gif_path):
-        if os.path.exists(fallback_path_1):
-            gif_path = fallback_path_1
-        elif os.path.exists(fallback_path_2):
-            gif_path = fallback_path_2
-        elif os.path.exists(fallback_path_3):
-            gif_path = fallback_path_3
-        else:
-            assets_dir = os.path.join(script_dir, "assets")
-            found_files = os.listdir(assets_dir) if os.path.exists(assets_dir) else []
-            await ctx.send(
-                f"**Error:** `{filename_base}` was not found.\n"
-                f"**Looked in:**\n"
-                f"1. `{gif_path}`\n"
-                f"2. `{fallback_path_1}`\n"
-                f"*(Working Directory: `{os.getcwd()}`)*\n\n"
-                f"**Files currently in `/assets/` directory:** `{found_files}`\n"
-                f"*Hint: Check if Windows hid an extension like `{filename_base}.gif`!*"
-            )
-            return
-
-    status_msg = await ctx.send(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
-    output_path = os.path.join(script_dir, f"{os.path.splitext(filename_base)[0]}_output.gif")
-
-    try:
-        with Image.open(gif_path) as im:
-            duration = im.info.get("duration") or 50
-            loop = im.info.get("loop") or 0
-
-            font = get_meme_font(28, script_dir)
-
-            avg_char_w = font.getlength("A") if hasattr(font, "getlength") else 15
-            chars_per_line = max(10, int((im.width - 24) / max(1, avg_char_w)))
-            lines = textwrap.wrap(text, width=chars_per_line)
-            if not lines:
-                lines = [text]
-
-            line_height = int(28 * 1.25)
-            caption_height = len(lines) * line_height + 24
-
-            new_width = im.width
-            new_height = im.height + caption_height
-
-            total_text_h = len(lines) * line_height
-            y_start = (caption_height - total_text_h) // 2
-
-            frames = []
-            for frame in ImageSequence.Iterator(im):
-                frame_rgba = frame.convert("RGBA")
-
-                canvas = Image.new("RGBA", (new_width, new_height), "white")
-                canvas.paste(frame_rgba, (0, caption_height))
-
-                draw = ImageDraw.Draw(canvas)
-                y_offset = y_start
-                for line in lines:
-                    line_w = font.getlength(line) if hasattr(font, "getlength") else draw.textlength(line, font=font)
-                    x = (new_width - line_w) // 2
-                    draw.text((x, y_offset), line, fill="black", font=font)
-                    y_offset += line_height
-
-                frames.append(canvas.convert("RGB"))
-
-            frames[0].save(
-                output_path,
-                save_all=True,
-                append_images=frames[1:],
-                duration=duration,
-                loop=loop
-            )
-
-        await ctx.send(file=discord.File(output_path))
-        await status_msg.delete()
-
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    except ImportError:
-        await status_msg.edit(content="Error: The `Pillow` library is not installed. Run `pip install Pillow` to use this command.")
-    except Exception as e:
-        await status_msg.edit(content=f"An error occurred while generating your meme: `{e}`")
-
-@bot.command()
-async def jarvis(ctx, *, text: str = None):
-    await render_captioned_gif(ctx, "jarvis.gif", "Jarvis", text)
-
-
-@bot.command()
-async def lowtiergod(ctx, *, text: str = None):
-    await render_captioned_gif(ctx, "lowtiergod.gif", "Low Tier God", text)
-
-
-@bot.command(aliases=["floating", "ascend", "sponge"])
-async def spongebob(ctx, *, text: str = None):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    target_file = "spongebob.gif"
-    for candidate in ["spongebob.gif", "floating.gif", "sponge.gif"]:
-        if os.path.exists(os.path.join(script_dir, "assets", candidate)) or os.path.exists(os.path.join(script_dir, candidate)):
-            target_file = candidate
-            break
-    await render_captioned_gif(ctx, target_file, "Spongebob Floating", text)
-
-@bot.command(aliases=["tuff", "hoodiebob", "sadbob"])
-async def tuffbob(ctx, *, text: str = None):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    target_file = "tuffbob.gif"
-    
-    # Check for the file in assets or root
-    for candidate in ["tuffbob.gif", "tuffbob.png", "tuffbob.jpg", "tuff.gif"]:
-        if os.path.exists(os.path.join(script_dir, "assets", candidate)) or os.path.exists(os.path.join(script_dir, candidate)):
-            target_file = candidate
-            break
-            
-    # Reuses your existing robust GIF generation engine
-    await render_captioned_gif(ctx, target_file, "Tuff Spongebob", text)
-
-@bot.command(aliases=["fanum", "food"])
-async def fanumfood(ctx, *, text: str = None):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    target_file = "fanumfood.gif"
-    for candidate in ["fanumfood.gif", "fanum.gif", "food.gif"]:
-        if os.path.exists(os.path.join(script_dir, "assets", candidate)) or os.path.exists(os.path.join(script_dir, candidate)):
-            target_file = candidate
-            break
-    await render_captioned_gif(ctx, target_file, "Fanum Food", text)
-
-
-@bot.command(aliases=["pilot", "crossview"])
-async def stephen(ctx, *, text: str = None):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    target_file = "stephen.gif"
-    for candidate in ["stephen.gif", "stephen.png", "stephen.jpg", "stephen.jpeg"]:
-        if os.path.exists(os.path.join(script_dir, "assets", candidate)) or os.path.exists(os.path.join(script_dir, candidate)):
-            target_file = candidate
-            break
-    await render_captioned_gif(ctx, target_file, "Stephen", text)
-
-
-# ============================================================
-# KATANA MAN MANGA PANEL MEME (SAVED AS .GIF)
-# ============================================================
-
-@bot.command(aliases=["reason", "heartbeats"])
-async def katanaman(ctx, *, text: str = None):
-    if not text:
-        await ctx.send(f"What is the reason this heart still beats? Give me some text! {EMOJI_BOYKISSER_HUH}")
-        return
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    possible_names = [
-        "katanaman.png", "katanaman.jpg", "katanaman.jpeg", "katanaman.gif",
-        "reason.png", "reason.jpg", "reason.jpeg", "reason.gif",
-        "heartbeats.png", "heartbeats.jpg", "heartbeats.gif"
-    ]
-
-    img_path = None
-    for name in possible_names:
-        p1 = os.path.join(script_dir, "assets", name)
-        p2 = os.path.join(script_dir, name)
-        if os.path.exists(p1):
-            img_path = p1
-            break
-        elif os.path.exists(p2):
-            img_path = p2
-            break
-
-    if not img_path:
-        assets_dir = os.path.join(script_dir, "assets")
-        found_files = os.listdir(assets_dir) if os.path.exists(assets_dir) else []
-        await ctx.send(
-            f"**Error:** Katana Man template was not found.\n"
-            f"Please save the image as `katanaman.png` in `/assets/` or the root folder.\n\n"
-            f"**Files currently in `/assets/`:** `{found_files}`"
-        )
-        return
-
-    status_msg = await ctx.send(f"Forging the reason GIF... please wait! {EMOJI_BOYKISSER_SEE}")
-    output_path = os.path.join(script_dir, "katanaman_output.gif")
-
-    try:
-        with Image.open(img_path) as im:
-            im = im.convert("RGB")
-            draw = ImageDraw.Draw(im)
-
-            W, H = im.size
-
-            box_x1 = int(W * 0.64)
-            box_x2 = int(W * 0.94)
-            box_y1 = int(H * 0.04)
-            box_y2 = int(H * 0.33)
-
-            box_w = box_x2 - box_x1
-            box_h = box_y2 - box_y1
-
-            formatted_text = text.upper()
-
-            max_font_size = max(18, int(box_h * 0.30))
-            min_font_size = 11
-
-            best_font = None
-            best_lines = []
-            best_line_h = 0
-
-            for f_size in range(max_font_size, min_font_size - 1, -1):
-                test_font = get_meme_font(f_size, script_dir)
-
-                avg_char_w = test_font.getlength("A") if hasattr(test_font, "getlength") else (f_size * 0.6)
-                chars_per_line = max(4, int(box_w / max(1, avg_char_w)))
-
-                lines = textwrap.wrap(formatted_text, width=chars_per_line)
-                if not lines:
-                    lines = [formatted_text]
-
-                line_spacing = int(f_size * 0.2)
-                line_h = f_size + line_spacing
-                total_h = len(lines) * line_h
-
-                max_line_w = 0
-                for line in lines:
-                    lw = test_font.getlength(line) if hasattr(test_font, "getlength") else len(line) * avg_char_w
-                    if lw > max_line_w:
-                        max_line_w = lw
-
-                if total_h <= box_h and max_line_w <= box_w:
-                    best_font = test_font
-                    best_lines = lines
-                    best_line_h = line_h
-                    break
-            else:
-                f_size = min_font_size
-                best_font = get_meme_font(f_size, script_dir)
-                best_lines = textwrap.wrap(formatted_text, width=max(4, int(box_w / (f_size * 0.6))))
-                best_line_h = f_size + int(f_size * 0.2)
-
-            total_text_h = len(best_lines) * best_line_h
-            current_y = box_y1 + (box_h - total_text_h) // 2
-
-            for line in best_lines:
-                lw = best_font.getlength(line) if hasattr(best_font, "getlength") else len(line) * (f_size * 0.6)
-                current_x = box_x1 + (box_w - lw) // 2
-                draw.text((current_x, current_y), line, fill="black", font=best_font)
-                current_y += best_line_h
-
-            im.save(output_path, format="GIF")
-
-        await ctx.send(file=discord.File(output_path))
-        await status_msg.delete()
-
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    except ImportError:
-        await status_msg.edit(content="Error: The `Pillow` library is not installed. Run `pip install Pillow` to use this command.")
-    except Exception as e:
-        await status_msg.edit(content=f"An error occurred while generating the panel: `{e}`")
-
-
-# ============================================================
-# YAO MING / BASKETBALL MEME (UNIVERSAL TEXT, CENTERED, .GIF)
-# ============================================================
-
-@bot.command(aliases=["yaoming", "cried"])
-async def basketball(ctx, *, text: str = None):
-    if not text:
-        await ctx.send(
-            f"Please provide text for the meme! {EMOJI_BOYKISSER_HUH}\n"
-            f"**Usage:** `{get_prefix(bot, ctx.message)}basketball <your text here>`"
-        )
-        return
-
-    meme_caption = text.strip()
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    possible_names = [
-        "basketball.png", "basketball.jpg", "basketball.jpeg", "basketball.gif",
-        "yaoming.png", "yaoming.jpg", "yaoming.jpeg", "yaoming.gif"
-    ]
-
-    img_path = None
-    for name_candidate in possible_names:
-        p1 = os.path.join(script_dir, "assets", name_candidate)
-        p2 = os.path.join(script_dir, name_candidate)
-        if os.path.exists(p1):
-            img_path = p1
-            break
-        elif os.path.exists(p2):
-            img_path = p2
-            break
-
-    if not img_path:
-        assets_dir = os.path.join(script_dir, "assets")
-        found_files = os.listdir(assets_dir) if os.path.exists(assets_dir) else []
-        await ctx.send(
-            f"**Error:** `basketball.png` was not found.\n"
-            f"Please save the template as `basketball.png` in `/assets/` or the root folder.\n\n"
-            f"**Files currently in `/assets/`:** `{found_files}`"
-        )
-        return
-
-    status_msg = await ctx.send(f"Processing tears GIF... please wait! {EMOJI_BOYKISSER_SEE}")
-    output_path = os.path.join(script_dir, "basketball_output.gif")
-
-    try:
-        with Image.open(img_path) as im:
-            im = im.convert("RGB")
-            draw = ImageDraw.Draw(im)
-
-            W, H = im.size
-
-            header_h = max(int(H * 0.16), 45)
-            draw.rectangle([0, 0, W, header_h], fill="black")
-
-            max_font_size = max(16, int(header_h * 0.40))
-            min_font_size = 10
-
-            best_font = None
-            best_lines = []
-            best_line_h = 0
-
-            max_text_width = int(W * 0.94)
-
-            for f_size in range(max_font_size, min_font_size - 1, -1):
-                test_font = get_meme_font(f_size, script_dir)
-
-                avg_char_w = test_font.getlength("A") if hasattr(test_font, "getlength") else (f_size * 0.55)
-                chars_per_line = max(8, int(max_text_width / max(1, avg_char_w)))
-
-                lines = textwrap.wrap(meme_caption, width=chars_per_line)
-                if not lines:
-                    lines = [meme_caption]
-
-                line_spacing = int(f_size * 0.25)
-                line_h = f_size + line_spacing
-                total_h = len(lines) * line_h
-
-                max_line_w = 0
-                for line in lines:
-                    lw = test_font.getlength(line) if hasattr(test_font, "getlength") else len(line) * avg_char_w
-                    if lw > max_line_w:
-                        max_line_w = lw
-
-                if total_h <= (header_h - 4) and max_line_w <= max_text_width and len(lines) <= 3:
-                    best_font = test_font
-                    best_lines = lines
-                    best_line_h = line_h
-                    break
-            else:
-                f_size = min_font_size
-                best_font = get_meme_font(f_size, script_dir)
-                best_lines = textwrap.wrap(meme_caption, width=max(8, int(max_text_width / (f_size * 0.55))))
-                best_line_h = f_size + int(f_size * 0.25)
-
-            total_text_h = len(best_lines) * best_line_h
-            y_start = (header_h - total_text_h) // 2
-
-            for line in best_lines:
-                line_w = best_font.getlength(line) if hasattr(best_font, "getlength") else len(line) * (f_size * 0.55)
-                x_start = (W - line_w) // 2
-                draw.text((x_start, y_start), line, fill="white", font=best_font)
-                y_start += best_line_h
-
-            im.save(output_path, format="GIF")
-
-        await ctx.send(file=discord.File(output_path))
-        await status_msg.delete()
-
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    except ImportError:
-        await status_msg.edit(content="Error: The `Pillow` library is not installed. Run `pip install Pillow` to use this command.")
-    except Exception as e:
-        await status_msg.edit(content=f"An error occurred while generating the meme: `{e}`")
-
-
-# ============================================================
-# ANNOUNCEMENT & LOG CHANNEL MANAGEMENT
-# ============================================================
-
-@bot.command()
-@moderator_only()
-async def announce(ctx, *, message):
-    embed = discord.Embed(title="Announcement", description=message, color=discord.Color.blurple())
-    embed.set_footer(text=f"Posted by {ctx.author}")
-    await ctx.send(
-        "@everyone",
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(everyone=True)
-    )
-
-
-@bot.command()
-@owner_only()
-async def setlog(ctx, channel: discord.TextChannel):
-    data["logs"][str(ctx.guild.id)] = channel.id
-    save_data()
-    await ctx.send(f"Moderation logs will now be sent to {channel.mention}.")
-
-
-@bot.command()
-@owner_only()
-async def disablelog(ctx):
-    data["logs"].pop(str(ctx.guild.id), None)
-    save_data()
-    await ctx.send("Moderation logging disabled.")
-
-
-# ============================================================
 # ERROR HANDLING
 # ============================================================
 
@@ -2971,6 +2829,17 @@ async def on_command_error(ctx, error):
 
     if isinstance(error, commands.CheckFailure):
         err_msg = str(error)
+
+        if "BLACKLISTED" in err_msg:
+            return
+
+        if "SPAMMING" in err_msg:
+            return
+
+        if "OWNER_ONLY" in err_msg:
+            await ctx.send("Only the bot developer is authorized to run this command.")
+            return
+
         if "DEVTEST_LOCKED:" in err_msg:
             ch_id = err_msg.split("DEVTEST_LOCKED:")[1].strip()
             await ctx.send(
