@@ -2,3 +2,6 @@
 /.env
 /.venv
 /.vscode
+/favorites.json
+/bot_data.json
+/playlists.json
