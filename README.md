@@ -219,7 +219,9 @@ report that the feature is unavailable.
 
 Bot settings, moderation warnings, and devtest state are stored in
 `bot_data.json`; favorites and playlists are stored in `favorites.json` and
-`playlists.json`. AI prompts are sent to the locally configured LM Studio
+`playlists.json`. Recognized command invocations are counted by canonical
+command name (without arguments, with aliases grouped together) in
+`command_usage.json`. AI prompts are sent to the locally configured LM Studio
 endpoint, not to a hosted AI API by this code. Discord command interactions
 still pass through Discord, and AI chat history is kept in bot memory only
 while the bot process is running.

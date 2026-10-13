@@ -49,6 +49,7 @@ TARGET_USER_ID = 1069224942756966410
 DATA_FILE = "bot_data.json"
 FAVORITES_FILE = "favorites.json"
 PLAYLISTS_FILE = "playlists.json"
+COMMAND_USAGE_FILE = "command_usage.json"
 
 
 # ============================================================
@@ -167,6 +168,30 @@ playlists_data = load_playlists()
 def save_playlists():
     with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
         json.dump(playlists_data, f, indent=4)
+
+
+def load_command_usage():
+    if not os.path.exists(COMMAND_USAGE_FILE):
+        return {}
+    with open(COMMAND_USAGE_FILE, "r", encoding="utf-8") as f:
+        usage = json.load(f)
+    if not isinstance(usage, dict) or any(
+        not isinstance(name, str)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        for name, count in usage.items()
+    ):
+        raise ValueError(f"{COMMAND_USAGE_FILE} must contain a JSON object of command names to non-negative counts.")
+    return usage
+
+
+command_usage = load_command_usage()
+
+
+def save_command_usage():
+    with open(COMMAND_USAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(command_usage, f, indent=4)
 
 
 def get_prefix(bot, message):
@@ -851,7 +876,8 @@ async def play_next_track(guild_id: int):
 
     vc = guild.voice_client
 
-    if state["loop"] and state["current"]:
+    is_loop_replay = bool(state["loop"] and state["current"])
+    if is_loop_replay:
         track = state["current"]
     elif state["queue"]:
         track = state["queue"].pop(0)
@@ -937,7 +963,7 @@ async def play_next_track(guild_id: int):
         if vc.channel:
             await update_vc_status(vc.channel, f"🎶 {clean_title}")
 
-        if state["text_channel"]:
+        if state["text_channel"] and not is_loop_replay:
             fx_note = f" (Effect: `{state['effect']}`)" if state["effect"] != "none" else ""
             embed = discord.Embed(
                 title="🎶 Now Playing",
@@ -3438,6 +3464,13 @@ async def on_ready():
     print(f"Version: {BOT_VERSION}")
     print(f"Servers: {len(bot.guilds)}")
     print("=" * 50)
+
+
+@bot.event
+async def on_command(ctx):
+    command_name = ctx.command.qualified_name.lower()
+    command_usage[command_name] = command_usage.get(command_name, 0) + 1
+    save_command_usage()
 
 
 @bot.event
