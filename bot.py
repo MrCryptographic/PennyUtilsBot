@@ -70,7 +70,7 @@ EMOJI_BOYKISSER_SMOKING = "<:boykisser_smoking:1542171221326700666>"
 EMOJI_BOYKISSER_EAT = "<:boykisser_eat:1542171220454146079>"
 EMOJI_BOYKISSER_BOOP = "<a:boykisser_boop:1542171219640582144>"
 EMOJI_BOYKISSER_RIGHT = "<:boykisser_right:1542171218663309362>"
-EMOJI_BOYKISSER_SEE = "<a:boykisser_see:1542171206042525856>>"
+EMOJI_BOYKISSER_SEE = "<a:boykisser_see:1542171206042525856>"
 EMOJI_BOYKISSER_HUH = "<:boykisser_huh:1542171195183599728>"
 
 
@@ -745,7 +745,7 @@ def cancel_disconnect(guild_id: int):
 async def resolve_stream(track_dict: dict):
     target_url = track_dict.get('webpage_url') or track_dict.get('url')
     
-    if target_url and "videoplayback" in target_url:
+    if target_url and (track_dict.get("is_attachment") or "videoplayback" in target_url):
         return target_url
 
     loop = asyncio.get_event_loop()
@@ -2151,6 +2151,7 @@ async def help_command(ctx):
         name="Playback & Queue",
         value=(
             f"`{prefix}play <query/URL>` — Play a track or full URL playlist\n"
+            f"`{prefix}playfile` — Play one audio file attached to the command or its replied-to message\n"
             f"`{prefix}queue` — Interactive queue with pagination & controls\n"
             f"`{prefix}nowplaying` — Live track player with interactive buttons\n"
             f"`{prefix}effect` — Interactive dropdown to select audio filters\n"
@@ -2490,6 +2491,74 @@ async def play(ctx, *, query: str = None):
             await status_msg.delete()
 
     if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_next_track(ctx.guild.id)
+
+@bot.command()
+@commands.guild_only()
+async def playfile(ctx):
+    attachments = ctx.message.attachments
+    if (
+        not attachments
+        and ctx.message.reference
+        and ctx.message.reference.message_id
+    ):
+        referenced_message = ctx.message.reference.resolved
+        if referenced_message is None:
+            try:
+                referenced_message = await ctx.channel.fetch_message(
+                    ctx.message.reference.message_id
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await ctx.send("I couldn't retrieve the message you replied to.")
+                return
+        attachments = referenced_message.attachments
+
+    if not attachments:
+        await ctx.send(
+            f"Attach one audio file to your `{get_prefix(bot, ctx.message)}playfile` "
+            "message, or reply to a message containing an audio file."
+        )
+        return
+
+    if len(attachments) != 1:
+        await ctx.send("Please attach exactly one audio file.")
+        return
+
+    attachment = attachments[0]
+    supported_extensions = {
+        ".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus",
+        ".wav", ".webm", ".wma",
+    }
+    extension = os.path.splitext(attachment.filename)[1].lower()
+    if extension not in supported_extensions:
+        supported = ", ".join(sorted(supported_extensions))
+        await ctx.send(f"Unsupported audio file type. Supported extensions: `{supported}`.")
+        return
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send(f"You must be in a voice channel first! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    voice_channel = ctx.author.voice.channel
+    voice_client = ctx.guild.voice_client
+    if not voice_client:
+        voice_client = await voice_channel.connect()
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    state = get_music_state(ctx.guild.id)
+    state["text_channel"] = ctx.channel
+    track = {
+        "title": sanitize_markdown(os.path.splitext(attachment.filename)[0], max_len=60),
+        "webpage_url": attachment.url,
+        "is_attachment": True,
+    }
+    state["queue"].append(track)
+
+    if voice_client.is_playing() or voice_client.is_paused():
+        await ctx.send(f"Added uploaded audio to the queue: **{track['title']}**.")
+    else:
+        await ctx.send(f"Playing uploaded audio: **{track['title']}**.")
         await play_next_track(ctx.guild.id)
 
 @bot.command(aliases=["s", "next"])

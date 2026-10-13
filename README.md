@@ -156,6 +156,7 @@ be in a voice channel; Penny also needs the required voice-channel permissions.
 | Command | Aliases | Description |
 | --- | --- | --- |
 | `;play <search query or URL>` | `;p` | Play a search result or URL; playlist URLs are queued. |
+| `;playfile` | — | Play one supported audio file attached to the command, or reply to a message containing that file and run `;playfile`; supported extensions: `.aac`, `.flac`, `.m4a`, `.mp3`, `.oga`, `.ogg`, `.opus`, `.wav`, `.webm`, and `.wma`. |
 | `;join` | — | Join or move to your voice channel. |
 | `;leave` | `;disconnect` | Disconnect and clear the current queue. |
 | `;skip` | `;s`, `;next` | Skip the current track. |
