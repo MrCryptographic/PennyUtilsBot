@@ -167,7 +167,7 @@ be in a voice channel; Penny also needs the required voice-channel permissions.
 | `;nowplaying` | `;np` | Show the current track and interactive player controls. |
 | `;volume [1-100]` | `;vol` | Show or set playback volume. |
 | `;loop` | — | Toggle looping of the current track. |
-| `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
+| `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `bitcrusher`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
 | `;autorestart` | `;autorestartfx`, `;autorestarteffect` | Toggle restarting the current track when an effect changes. |
 | `;autoplay` | `;ap`, `;auto` | Toggle automatic related-track playback when the queue ends. |
 | `;favorite [search query or URL]` | `;fav` | Save the current track, or look up and save a supplied track. Favorites are saved to both this server and your personal list. |
