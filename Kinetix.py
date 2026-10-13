@@ -25,7 +25,7 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================
 
-BOT_VERSION = "2.8.0"
+BOT_VERSION = "2.9.0"
 TOKEN = os.getenv("TOKEN")
 
 # Default command prefix
