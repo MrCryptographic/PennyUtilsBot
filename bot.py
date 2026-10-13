@@ -210,6 +210,17 @@ def sanitize_markdown(text: str, max_len: int = 50) -> str:
     return cleaned
 
 
+def is_discord_attachment_url(url: str) -> bool:
+    parsed_url = urllib.parse.urlparse(url)
+    hostname = (parsed_url.hostname or "").lower()
+    discord_domains = ("discord.com", "discordapp.com", "discordapp.net")
+    is_discord_host = any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in discord_domains
+    )
+    return is_discord_host and "/attachments/" in parsed_url.path.lower()
+
+
 def get_meme_font(size: int, script_dir: str):
     candidates = [
         os.path.join(script_dir, "impact.ttf"),
@@ -1095,6 +1106,14 @@ class NowPlayingView(discord.ui.View):
             return
 
         track = state["current"]
+        track_url = track.get("webpage_url") or ""
+        if track.get("is_attachment") or is_discord_attachment_url(track_url):
+            await interaction.response.send_message(
+                "Uploaded Discord audio files cannot be added to favorites.",
+                ephemeral=True
+            )
+            return
+
         guild_id_str = str(self.guild_id)
         user_id_str = str(interaction.user.id)
 
@@ -2897,6 +2916,10 @@ async def favorite(ctx, *, query: str = None):
     target_track = None
 
     if query:
+        if is_discord_attachment_url(query.strip("<>")):
+            await ctx.send("Uploaded Discord audio files cannot be added to favorites.")
+            return
+
         loop = asyncio.get_event_loop()
         try:
             def _extract():
@@ -2918,12 +2941,7 @@ async def favorite(ctx, *, query: str = None):
         return
 
     target_url = target_track.get("webpage_url") or ""
-    target_host = urllib.parse.urlparse(target_url).hostname
-    if target_track.get("is_attachment") or target_host in {
-        "cdn.discordapp.com",
-        "cdn.discordapp.net",
-        "media.discordapp.net",
-    }:
+    if target_track.get("is_attachment") or is_discord_attachment_url(target_url):
         await ctx.send("Uploaded Discord audio files cannot be added to favorites.")
         return
 
