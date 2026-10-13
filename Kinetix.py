@@ -1892,6 +1892,10 @@ async def tryhard(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "tryhard.gif", "Tryhard", text)
 
 @bot.command()
+async def bkleash(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "boykisser-leash.gif", "Boykisser Leash", text)
+
+@bot.command()
 async def lockin(ctx, *, text: str = None):
     if not text or "|" not in text:
         await ctx.send(
@@ -2123,6 +2127,7 @@ async def help_command(ctx):
             f"`{prefix}katanaman <text>` — Fill the Katana Man manga panel\n"
             f"`{prefix}basketball <text>` — Yao Ming meme with any custom text\n"
             f"`{prefix}tryhard <text>` — Caption the Tryhard meme GIF\n"
+            f"`{prefix}bkleash <text>` — Caption the Boykisser Leash meme GIF\n"
             f"`{prefix}lockin <first caption> | <second caption>` — Caption both panels of the Lock In meme\n"
             f"`{prefix}quotethis` — Reply to a message with this command to quote it!"
         ),
