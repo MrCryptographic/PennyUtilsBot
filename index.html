@@ -111,19 +111,24 @@
             <h3>1. What Data We Collect</h3>
             <p>PennyUtils collects the minimum amount of data necessary to function. We store:</p>
             <ul>
-                <li><strong>Discord User IDs & Guild (Server) IDs:</strong> Used to track warnings, custom playlists, favorites, command blacklists, and server configurations.</li>
-                <li><strong>Chat History (Temporary):</strong> When interacting with the AI chat feature, the last 10 messages of your conversation are kept in temporary system memory to maintain conversational context. This is cleared upon bot restart or when you use the clear command.</li>
-                <li><strong>Command Usage:</strong> We log command usage locally to monitor bot performance and prevent spam/abuse.</li>
+                <li><strong>Discord identifiers and settings:</strong> User IDs and server IDs are stored as needed for warnings, favorites, playlists, blacklists, moderation settings, prefixes, and other server configuration.</li>
+                <li><strong>Command usage totals:</strong> The bot increments a local count for each recognized command, grouped by the command's canonical name (aliases count under the same name). Arguments and per-user command histories are not included in this counter. Counts are stored in <code>command_usage.json</code>.</li>
+                <li><strong>Moderation and message logs:</strong> If a server owner configures a log channel, moderation actions and message edits/deletions are sent there as Discord embeds. Logs may include message text, author and moderator identifiers, channel/message identifiers, attachment filenames, and action details. Purge logs include the contents available to the bot when messages are deleted. If Discord does not provide the message in the bot's cache, the log indicates that its contents are unavailable. Deletion logs identify the moderator only when a matching Discord audit-log entry can be found.</li>
+                <li><strong>AI chat history:</strong> The active conversation is kept in bot memory, associated with your Discord user ID, until you clear it, change persona, or the bot restarts. The bot sends the most recent 10 conversation entries as context for each request; older entries may remain in memory until the conversation is cleared.</li>
+                <li><strong>Uploaded audio:</strong> When you use the play-file command, the bot streams the attached audio from its Discord attachment URL for playback. It does not intentionally save the audio file to its local data files. The message and attachment remain subject to Discord's own handling and retention.</li>
             </ul>
 
             <h3>2. How We Use Your Data</h3>
-            <p>Data is strictly used to provide the bot's intended features to you (e.g., fetching your saved playlists, applying moderation rules). PennyUtils relies on a local, self-hosted AI model (via LM Studio); your chat data is <strong>never</strong> sent to third-party corporate APIs like OpenAI or Google.</p>
+            <p>Data is used to provide and maintain the bot's features, such as retrieving saved playlists, applying moderation actions, keeping command totals, and recording events in a server-configured log channel. AI prompts are sent by the bot to the LM Studio server configured by its operator. The bot code uses a local endpoint by default and does not itself send prompts to a hosted AI provider; Discord still processes the messages and attachments you send through Discord.</p>
 
             <h3>3. Data Storage and Security</h3>
-            <p>All data is stored in local JSON files (`bot_data.json`, `favorites.json`, `playlists.json`) on the host machine. We do not sell, rent, or share your data with any third parties.</p>
+            <p>Bot settings, warnings, favorites, playlists, and command totals are stored in local JSON files (<code>bot_data.json</code>, <code>favorites.json</code>, <code>playlists.json</code>, and <code>command_usage.json</code>) on the bot host. Active AI chat history and music queues are held in memory while the bot is running. Configured moderation and message logs are sent to Discord channels selected by the server owner and are subject to Discord's storage, access, and retention controls. The bot operator does not sell personal data.</p>
 
             <h3>4. Data Deletion</h3>
-            <p>You have the right to request the deletion of your data (User ID, saved playlists, favorites, and warnings). To do so, please contact the bot developer.</p>
+            <p>AI chat history can be cleared with the bot's clear-chat command and is also cleared when you change personas or when the bot restarts. For deletion of persistent bot data associated with you, contact the bot developer. Server owners and administrators manage messages in their configured Discord log channels under their server's policies; deleting a source message does not automatically remove a copy already recorded in a log channel. Command usage totals are aggregate counts and are not attributed to individual users.</p>
+
+            <h3>5. AI-Generated Content</h3>
+            <p>The <code>superuncensored</code> persona may produce strong language, offensive material, or otherwise inappropriate content. It is not suitable for all audiences. Use discretion; AI responses may be inaccurate or unsuitable and should not be treated as professional advice.</p>
         </div>
 
         <!-- TERMS OF SERVICE SECTION -->
@@ -137,15 +142,19 @@
             <h3>2. Usage Restrictions</h3>
             <p>You agree not to:</p>
             <ul>
-                <li>Use the bot to generate illegal, highly offensive, or severely abusive content.</li>
                 <li>Intentionally spam commands to lag or crash the bot. (An automatic anti-spam timeout system is in place).</li>
                 <li>Exploit bugs or vulnerabilities in the bot's code.</li>
+                <li>Use the bot or its AI personas to violate Discord's Terms of Service or Community Guidelines, applicable law, or the rules of the server where it is used.</li>
             </ul>
+            <p>AI-generated output is not reviewed or guaranteed to be accurate or appropriate. In particular, the <code>superuncensored</code> persona can produce offensive or inappropriate content and is not suitable for all audiences. The user is responsible for reviewing and deciding whether to share AI output.</p>
 
-            <h3>3. Service Availability</h3>
+            <h3>3. Server Logging and Uploaded Content</h3>
+            <p>Server owners may configure a channel to receive moderation and message event logs. Those logs can include message contents and identifying details, including content from purges. By using the bot in a server, understand that its configured features may process and record the information described in this Privacy Policy. Uploaded audio used for playback is streamed from Discord and is not intentionally retained as a local bot file.</p>
+
+            <h3>4. Service Availability</h3>
             <p>PennyUtils is provided on an "AS IS" and "AS AVAILABLE" basis. The developer makes no guarantees regarding 100% uptime, data persistence, or bug-free operation. Playlists and favorites may be lost during data migrations or hardware failures.</p>
 
-            <h3>4. Right to Terminate</h3>
+            <h3>5. Right to Terminate</h3>
             <p>The developer reserves the right to blacklist any user or restrict the bot from operating in any server at their sole discretion, at any time, without prior notice.</p>
         </div>
     </div>
