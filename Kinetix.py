@@ -8,9 +8,11 @@ import subprocess
 import random
 import asyncio
 import traceback
+import urllib.parse
+import unicodedata
+from functools import lru_cache
 import yt_dlp
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
-import textwrap
 from dotenv import load_dotenv
 
 # Import our new modular AI Chat file
@@ -23,7 +25,7 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================
 
-BOT_VERSION = "2.7.0"
+BOT_VERSION = "2.8.0"
 TOKEN = os.getenv("TOKEN")
 
 # Default command prefix
@@ -57,19 +59,18 @@ EMOJI_SMIRK = "<:smirk:1541467234986234007>"
 EMOJI_SHY = "<:shy:1541467234092974170>"
 EMOJI_LOVE = "<:love:1541467233161576581>"
 EMOJI_SHOCKED = "<:shocked:1541467232012472401>"
-
-EMOJI_PURPLE = "<:purple:1542171234794733578>"
+EMOJI_PURPLE = "<a:purple:1542171234794733578>"
 EMOJI_PIZZA = "<:pizza:1542171232898908260>"
-EMOJI_DANCING = "<:dancing:1542171231418196068>"
+EMOJI_DANCING = "<a:dancing:1542171231418196068>"
 EMOJI_KISS_NEW = "<:kiss:1542171226754261083>"
 EMOJI_SMILE = "<:smile:1542171225399500830>"
-EMOJI_BOYKISSER = "<:boykisser:1542171233767654441>"
+EMOJI_BOYKISSER = "<:boykisser:1542171223767654441>"
 EMOJI_BOYKISSER_HAPPY = "<:boykisser_happy:1542171222400438312>"
 EMOJI_BOYKISSER_SMOKING = "<:boykisser_smoking:1542171221326700666>"
 EMOJI_BOYKISSER_EAT = "<:boykisser_eat:1542171220454146079>"
-EMOJI_BOYKISSER_BOOP = "<:boykisser_boop:1542171219640582144>"
+EMOJI_BOYKISSER_BOOP = "<a:boykisser_boop:1542171219640582144>"
 EMOJI_BOYKISSER_RIGHT = "<:boykisser_right:1542171218663309362>"
-EMOJI_BOYKISSER_SEE = "<:boykisser_see:1542171206042525856>"
+EMOJI_BOYKISSER_SEE = "<a:boykisser_see:1542171206042525856>>"
 EMOJI_BOYKISSER_HUH = "<:boykisser_huh:1542171195183599728>"
 
 
@@ -102,11 +103,8 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-            
-            # Migrate legacy list blacklist format to new dict format
             if "blacklist" in loaded and isinstance(loaded["blacklist"], list):
                 loaded["blacklist"] = {"all": loaded["blacklist"]}
-                
             for key, val in default_data.items():
                 if key not in loaded:
                     loaded[key] = val
@@ -208,6 +206,216 @@ def get_meme_font(size: int, script_dir: str):
         return ImageFont.load_default()
 
 
+@lru_cache(maxsize=32)
+def _load_meme_font(path: str, size: int):
+    return ImageFont.truetype(path, size)
+
+
+@lru_cache(maxsize=8192)
+def _font_supports_meme_character(path: str, size: int, character: str) -> bool:
+    try:
+        font = _load_meme_font(path, size)
+        glyph = font.getmask(character)
+        missing_glyph = font.getmask("\U0010ffff")
+        return glyph.size != missing_glyph.size or bytes(glyph) != bytes(missing_glyph)
+    except (OSError, ValueError):
+        return False
+
+
+def _meme_fallback_font_paths(script_dir: str):
+    windows_fonts = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+    candidates = [
+        os.path.join(windows_fonts, "segoeui.ttf"),
+        os.path.join(windows_fonts, "arial.ttf"),
+        os.path.join(windows_fonts, "tahoma.ttf"),
+        os.path.join(windows_fonts, "simsun.ttc"),
+        os.path.join(windows_fonts, "seguiemj.ttf"),
+    ]
+    paths = []
+    primary = get_meme_font(16, script_dir)
+    primary_path = getattr(primary, "path", None)
+    if isinstance(primary_path, str):
+        paths.append(primary_path)
+    paths.extend(path for path in candidates if os.path.isfile(path))
+    return list(dict.fromkeys(paths))
+
+
+def _is_meme_emoji(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2300 <= codepoint <= 0x23FF
+        or 0x1F1E6 <= codepoint <= 0x1F1FF
+        or codepoint in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299)
+    )
+
+
+@lru_cache(maxsize=1)
+def _arabic_presentation_forms():
+    forms = {}
+    for codepoint in (*range(0xFB50, 0xFE00), *range(0xFE70, 0xFF00)):
+        character = chr(codepoint)
+        name = unicodedata.name(character, "")
+        if "ARABIC LETTER" not in name:
+            continue
+        normalized = unicodedata.normalize("NFKC", character)
+        if len(normalized) != 1:
+            continue
+
+        form_name = next(
+            (form for form in ("ISOLATED", "FINAL", "INITIAL", "MEDIAL") if name.endswith(f"{form} FORM")),
+            None
+        )
+        if form_name:
+            forms.setdefault(normalized, {})[form_name.lower()] = character
+    return forms
+
+
+def _shape_arabic_for_basic_pillow(text: str) -> str:
+    forms = _arabic_presentation_forms()
+    shaped = list(text)
+    arabic_indexes = [
+        index for index, character in enumerate(text)
+        if unicodedata.bidirectional(character) in ("R", "AL")
+    ]
+    for index in arabic_indexes:
+        character_forms = forms.get(text[index])
+        if not character_forms:
+            continue
+
+        previous_index = index - 1
+        while previous_index >= 0 and unicodedata.category(text[previous_index]) in ("Mn", "Mc", "Me"):
+            previous_index -= 1
+        next_index = index + 1
+        while next_index < len(text) and unicodedata.category(text[next_index]) in ("Mn", "Mc", "Me"):
+            next_index += 1
+
+        previous_forms = forms.get(text[previous_index], {}) if previous_index >= 0 else {}
+        next_forms = forms.get(text[next_index], {}) if next_index < len(text) else {}
+        joins_previous = "initial" in previous_forms and "final" in character_forms
+        joins_next = "initial" in character_forms and "final" in next_forms
+
+        if joins_previous and joins_next:
+            form = "medial"
+        elif joins_previous:
+            form = "final"
+        elif joins_next:
+            form = "initial"
+        else:
+            form = "isolated"
+        shaped[index] = character_forms.get(form, character_forms.get("isolated", text[index]))
+
+    if not arabic_indexes:
+        return text
+
+    start = arabic_indexes[0]
+    end = arabic_indexes[-1] + 1
+    rtl_segment = shaped[start:end]
+    return "".join(shaped[:start] + list(reversed(rtl_segment)) + shaped[end:])
+
+
+def _meme_font_for_character(character: str, primary_font, fallback_paths: list[str]):
+    primary_path = getattr(primary_font, "path", None)
+    size = getattr(primary_font, "size", 28)
+    if isinstance(primary_path, bytes):
+        primary_path = os.fsdecode(primary_path)
+    if isinstance(primary_path, str) and _font_supports_meme_character(primary_path, size, character):
+        return primary_font, False, True
+
+    emoji_character = _is_meme_emoji(character)
+    for path in fallback_paths:
+        if path == primary_path:
+            continue
+        is_emoji_font = os.path.basename(path).lower() == "seguiemj.ttf"
+        if emoji_character and not is_emoji_font:
+            continue
+        if not emoji_character and is_emoji_font:
+            continue
+        if _font_supports_meme_character(path, size, character):
+            try:
+                return _load_meme_font(path, size), is_emoji_font, True
+            except (OSError, ValueError):
+                continue
+    return primary_font, False, False
+
+
+def _meme_text_runs(text: str, primary_font, script_dir: str):
+    fallback_paths = _meme_fallback_font_paths(script_dir)
+    runs = []
+    previous_font = primary_font
+    previous_emoji = False
+    for character in text:
+        if unicodedata.category(character) in ("Cf", "Mn", "Mc", "Me") or (
+            character.isspace() and previous_font is not primary_font
+        ):
+            font, is_emoji = previous_font, previous_emoji
+            supported = True
+        else:
+            font, is_emoji, supported = _meme_font_for_character(character, primary_font, fallback_paths)
+            previous_font, previous_emoji = font, is_emoji
+        if not supported:
+            character = "?"
+
+        if runs and runs[-1][1] is font and runs[-1][2] == is_emoji:
+            runs[-1] = (runs[-1][0] + character, font, is_emoji)
+        else:
+            runs.append((character, font, is_emoji))
+    return runs
+
+
+def _meme_text_width(text: str, primary_font, script_dir: str) -> float:
+    width = 0
+    for run, font, _ in _meme_text_runs(text, primary_font, script_dir):
+        width += font.getlength(run) if hasattr(font, "getlength") else len(run) * getattr(font, "size", 16)
+    return width
+
+
+def _draw_meme_text(draw, position, text: str, fill, primary_font, script_dir: str):
+    x, y = position
+    for run, font, is_emoji in _meme_text_runs(text, primary_font, script_dir):
+        run = _shape_arabic_for_basic_pillow(run)
+        draw.text((x, y), run, fill=fill, font=font, embedded_color=is_emoji)
+        x += font.getlength(run) if hasattr(font, "getlength") else len(run) * getattr(font, "size", 16)
+
+
+def _wrap_meme_text(text: str, max_width: int, primary_font, script_dir: str) -> list[str]:
+    lines = []
+    for paragraph in text.splitlines() or [""]:
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+
+        line = ""
+        for word in words:
+            candidate = f"{line} {word}".strip()
+            if not line or _meme_text_width(candidate, primary_font, script_dir) <= max_width:
+                if _meme_text_width(candidate, primary_font, script_dir) <= max_width:
+                    line = candidate
+                    continue
+            if line:
+                lines.append(line)
+                line = ""
+
+            if _meme_text_width(word, primary_font, script_dir) <= max_width:
+                line = word
+                continue
+
+            part = ""
+            for character in word:
+                candidate_part = part + character
+                if part and _meme_text_width(candidate_part, primary_font, script_dir) > max_width:
+                    lines.append(part)
+                    part = character
+                else:
+                    part = candidate_part
+            line = part
+        if line:
+            lines.append(line)
+    return lines or [""]
+
+
 # ============================================================
 # BOT SETUP
 # ============================================================
@@ -256,15 +464,10 @@ def owner_only():
 async def blacklist_check(ctx):
     uid = ctx.author.id
     bl = data.get("blacklist", {})
-    
-    # Check total blacklist
     if uid in bl.get("all", []):
         raise commands.CheckFailure("BLACKLISTED")
-        
-    # Check command-specific blacklist
     if ctx.command and uid in bl.get(ctx.command.name, []):
         raise commands.CheckFailure("BLACKLISTED")
-        
     return True
 
 
@@ -272,16 +475,12 @@ async def blacklist_check(ctx):
 async def disabled_command_check(ctx):
     if not ctx.command:
         return True
-        
     cmd_name = ctx.command.name
     disabled = data.get("disabled_commands", {"global": [], "guilds": {}})
-    
     if cmd_name in disabled.get("global", []):
         raise commands.CheckFailure(f"DISABLED_GLOBAL:{cmd_name}")
-        
     if ctx.guild and cmd_name in disabled.get("guilds", {}).get(str(ctx.guild.id), []):
         raise commands.CheckFailure(f"DISABLED_SERVER:{cmd_name}")
-        
     return True
 
 
@@ -289,13 +488,12 @@ async def disabled_command_check(ctx):
 async def anti_spam_check(ctx):
     if is_moderator(ctx.author.id):
         return True
-
     if not ctx.guild:
         return True
 
     now = datetime.now()
     user_id = ctx.author.id
-    SPAM_COOLDOWN = 3.0 # Allow 1 command every 3 seconds
+    SPAM_COOLDOWN = 3.0
 
     if user_id not in user_spam_tracker:
         user_spam_tracker[user_id] = {"last_cmd": now, "warnings": 0}
@@ -393,9 +591,7 @@ async def persona(ctx, name: str = None):
 
     data["personas"][str(ctx.author.id)] = name
     save_data()
-    
     user_chat_history.pop(ctx.author.id, None)
-    
     await ctx.send(f"Your AI persona has been updated to **{name}**. Conversation history cleared! {EMOJI_BLUSH}")
 
 @bot.command()
@@ -475,10 +671,12 @@ def get_music_state(guild_id: int):
     if guild_id not in music_states:
         music_states[guild_id] = {
             "queue": [],
+            "history": [],
             "current": None,
             "effect": "none",
             "volume": 0.5,
             "loop": False,
+            "autoplay": False,
             "autorestart_on_effect": True,
             "disconnect_task": None,
             "text_channel": None
@@ -581,11 +779,61 @@ async def play_next_track(guild_id: int):
     elif state["queue"]:
         track = state["queue"].pop(0)
         state["current"] = track
+        state["history"].append(track)
+    elif state.get("autoplay") and state["history"]:
+        # Youtube Autoplay logic using RD Mix playlist
+        last_url = state["history"][-1].get("webpage_url", "")
+        
+        parsed = urllib.parse.urlparse(last_url)
+        vid_id = None
+        if parsed.hostname in ['www.youtube.com', 'youtube.com', 'm.youtube.com']:
+            qs = urllib.parse.parse_qs(parsed.query)
+            if 'v' in qs:
+                vid_id = qs['v'][0]
+        elif parsed.hostname == 'youtu.be':
+            vid_id = parsed.path.lstrip('/')
+
+        track = None
+        if vid_id:
+            mix_url = f"https://www.youtube.com/watch?v={vid_id}&list=RD{vid_id}"
+            loop_ev = asyncio.get_event_loop()
+            def _get_mix():
+                with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True, 'no_warnings': True}) as ydl:
+                    return ydl.extract_info(mix_url, download=False)
+            try:
+                mix_info = await loop_ev.run_in_executor(None, _get_mix)
+                if mix_info and 'entries' in mix_info:
+                    for entry in mix_info['entries']:
+                        if entry and entry.get('id'):
+                            url_check = f"https://www.youtube.com/watch?v={entry['id']}"
+                            # Pick a related song that wasn't recently played
+                            if not any(t.get('webpage_url') == url_check for t in state["history"][-15:]):
+                                track = {
+                                    'title': sanitize_markdown(entry.get('title', 'Autoplay Track'), max_len=60),
+                                    'webpage_url': url_check
+                                }
+                                state["current"] = track
+                                state["history"].append(track)
+                                if state["text_channel"]:
+                                    await state["text_channel"].send(f"📻 **Autoplay** queued related track: **{track['title']}** {EMOJI_BLUSH}")
+                                break
+            except Exception as e:
+                print(f"[Autoplay Error]: {e}")
+
+        if not track:
+            state["current"] = None
+            await update_vc_status(vc.channel, None)
+            await schedule_disconnect(guild_id, delay=180)
+            return
     else:
         state["current"] = None
         await update_vc_status(vc.channel, None)
         await schedule_disconnect(guild_id, delay=180)
         return
+
+    # Cap history to 50 items
+    if len(state["history"]) > 50:
+        state["history"].pop(0)
 
     cancel_disconnect(guild_id)
 
@@ -727,7 +975,14 @@ class NowPlayingView(discord.ui.View):
         status = "enabled" if state["loop"] else "disabled"
         await interaction.response.send_message(f"Loop is now **{status}**! 🔂", ephemeral=True)
 
-    @discord.ui.button(label="❤️ Favorite", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="📻 Autoplay", style=discord.ButtonStyle.secondary)
+    async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        state["autoplay"] = not state.get("autoplay", False)
+        status = "enabled" if state["autoplay"] else "disabled"
+        await interaction.response.send_message(f"Autoplay is now **{status}**! 📻", ephemeral=True)
+
+    @discord.ui.button(label="❤️", style=discord.ButtonStyle.success)
     async def fav_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         if not state["current"]:
@@ -894,174 +1149,202 @@ class FavoritesView(discord.ui.View):
         self.page = 0
         self.rebuild_ui()
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message(
-                "Only the command author can control this menu!",
-                ephemeral=True
-            )
-            return False
-        return True
-
     def get_list(self):
         if self.mode == "guild":
             return favorites_data["guilds"].get(str(self.ctx.guild.id), [])
-        return favorites_data["users"].get(str(self.ctx.author.id), [])
-
-    def get_embed(self):
-        favorites = self.get_list()
-        title = "🌐 Server Favorites" if self.mode == "guild" else "👤 My Personal Favorites"
-        embed = discord.Embed(title=title, color=discord.Color.gold())
-        if not favorites:
-            embed.description = "No favorites saved yet! Use `;favorite` to save a track."
-            return embed
-
-        page_size = 6
-        total_pages = max(1, (len(favorites) + page_size - 1) // page_size)
-        self.page = min(self.page, total_pages - 1)
-        start = self.page * page_size
-        lines = []
-        for index, item in enumerate(favorites[start:start + page_size], start + 1):
-            title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=50)
-            url = item.get("url", "")
-            lines.append(f"`{index}.` [{title}]({url})")
-        embed.description = "\n".join(lines)
-        embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total saved: {len(favorites)}")
-        return embed
+        else:
+            return favorites_data["users"].get(str(self.ctx.author.id), [])
 
     def rebuild_ui(self):
         self.clear_items()
-        favorites = self.get_list()
-        page_size = 6
-        total_pages = max(1, (len(favorites) + page_size - 1) // page_size)
+        fav_list = self.get_list()
+        items_per_page = 6
+        total_pages = max(1, (len(fav_list) + items_per_page - 1) // items_per_page)
         self.page = min(self.page, total_pages - 1)
 
-        toggle = discord.ui.Button(
-            label="Switch to My Favorites" if self.mode == "guild" else "Switch to Server Favorites",
-            style=discord.ButtonStyle.primary,
-            row=0
-        )
-        toggle.callback = self.toggle_mode
-        self.add_item(toggle)
+        toggle_label = "Switch to My Favorites 👤" if self.mode == "guild" else "Switch to Server Favorites 🌐"
+        toggle_btn = discord.ui.Button(label=toggle_label, style=discord.ButtonStyle.primary, row=0)
+        toggle_btn.callback = self.toggle_mode
+        self.add_item(toggle_btn)
 
-        play_all = discord.ui.Button(
-            label="▶️ Play All", style=discord.ButtonStyle.success, row=0, disabled=not favorites
-        )
-        play_all.callback = self.play_all
-        self.add_item(play_all)
+        play_all_btn = discord.ui.Button(label="▶️ Play All Favs", style=discord.ButtonStyle.success, row=0, disabled=(len(fav_list) == 0))
+        play_all_btn.callback = self.play_all_favs
+        self.add_item(play_all_btn)
 
-        if favorites:
-            options = []
-            start = self.page * page_size
-            for index, item in enumerate(favorites[start:start + page_size], start):
-                title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=80)
-                options.append(discord.SelectOption(label=f"{index + 1}. {title}"[:100], value=str(index)))
-            select = discord.ui.Select(placeholder="Play a favorite...", options=options, row=1)
+        prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1, disabled=(self.page <= 0))
+        prev_btn.callback = self.prev_page
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.page >= total_pages - 1))
+        next_btn.callback = self.next_page
+        self.add_item(next_btn)
+
+        start = self.page * items_per_page
+        end = start + items_per_page
+        current_page_items = fav_list[start:end]
+
+        if current_page_items:
+            play_options = []
+            del_options = []
+            for idx, item in enumerate(current_page_items, start):
+                clean_title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=55)
+                added_date = str(item.get("added_at", ""))[:90]
+                label_text = f"{idx + 1}. {clean_title}"[:100]
+                play_options.append(discord.SelectOption(label=label_text, value=str(idx), description=added_date))
+                del_options.append(discord.SelectOption(label=f"Delete #{idx + 1}: {clean_title[:80]}"[:100], value=str(idx), description=added_date))
+
+            select = discord.ui.Select(placeholder="Select a song to queue/play...", options=play_options, row=2)
             select.callback = self.select_song
             self.add_item(select)
 
-            remove = discord.ui.Select(
-                placeholder="Remove a favorite...",
-                options=[
-                    discord.SelectOption(label=f"Remove #{start + offset + 1}: {option.label.split('. ', 1)[-1]}"[:100],
-                                         value=option.value)
-                    for offset, option in enumerate(options)
-                ],
-                row=2
-            )
-            remove.callback = self.remove_song
-            self.add_item(remove)
+            remove_select = discord.ui.Select(placeholder="Delete a favorite...", options=del_options, row=3)
+            remove_select.callback = self.remove_song
+            self.add_item(remove_select)
 
-        previous = discord.ui.Button(
-            label="◀ Prev", style=discord.ButtonStyle.secondary, row=3, disabled=self.page == 0
-        )
-        previous.callback = self.prev_page
-        self.add_item(previous)
-        following = discord.ui.Button(
-            label="Next ▶", style=discord.ButtonStyle.secondary,
-            row=3, disabled=self.page >= total_pages - 1
-        )
-        following.callback = self.next_page
-        self.add_item(following)
+    def get_embed(self):
+        fav_list = self.get_list()
+        title = "🌐 Server Favorites" if self.mode == "guild" else "👤 My Personal Favorites (All Servers)"
+        embed = discord.Embed(title=title, color=discord.Color.gold())
+
+        if not fav_list:
+            embed.description = "No favorites saved yet! Use `;favorite` to save your first track."
+            return embed
+
+        items_per_page = 6
+        total_pages = max(1, (len(fav_list) + items_per_page - 1) // items_per_page)
+        self.page = min(self.page, total_pages - 1)
+
+        start = self.page * items_per_page
+        end = start + items_per_page
+        current_slice = fav_list[start:end]
+
+        lines = ""
+        for idx, item in enumerate(current_slice, start + 1):
+            clean_title = sanitize_markdown(item.get("title", "Unknown Track"), max_len=50)
+            url = item.get("url", "")
+            extra = f" • <@{item['user_id']}>" if self.mode == "guild" and "user_id" in item else ""
+            line = f"`{idx}.` [{clean_title}]({url}){extra}\n"
+            if len(lines) + len(line) < 3500:
+                lines += line
+
+        embed.description = lines
+        embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total saved: {len(fav_list)}")
+        return embed
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
+            return
+        if self.page > 0:
+            self.page -= 1
+            self.rebuild_ui()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    async def next_page(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
+            return
+        fav_list = self.get_list()
+        total_pages = max(1, (len(fav_list) + 5) // 6)
+        if self.page < total_pages - 1:
+            self.page += 1
+            self.rebuild_ui()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     async def toggle_mode(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Only the command author can control this menu!", ephemeral=True)
+            return
+
         self.mode = "user" if self.mode == "guild" else "guild"
         self.page = 0
         self.rebuild_ui()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    async def play_all(self, interaction: discord.Interaction):
-        favorites = self.get_list()
-        if not favorites:
+    async def play_all_favs(self, interaction: discord.Interaction):
+        fav_list = self.get_list()
+        if not fav_list:
             await interaction.response.send_message("No favorites to play!", ephemeral=True)
             return
+
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+            await interaction.response.send_message("You must be in a voice channel first!", ephemeral=True)
             return
 
         await interaction.response.defer()
+
         voice_channel = interaction.user.voice.channel
-        voice_client = interaction.guild.voice_client
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
+        vc = interaction.guild.voice_client
+        if not vc:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-        state["queue"].extend(
-            {"title": track["title"], "webpage_url": track["url"]}
-            for track in favorites
-        )
-        if not voice_client.is_playing() and not voice_client.is_paused():
+
+        for item in fav_list:
+            state["queue"].append({
+                "title": item["title"],
+                "webpage_url": item["url"]
+            })
+
+        if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing all **{len(favorites)}** favorites! 🎶")
+            await self.ctx.send(f"Now playing all **{len(fav_list)}** favorite(s)! 🎶 {EMOJI_DANCING}")
         else:
-            await self.ctx.send(f"Queued all **{len(favorites)}** favorites! 🎶")
-
-    async def prev_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.rebuild_ui()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        self.page += 1
-        self.rebuild_ui()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            await self.ctx.send(f"Added all **{len(fav_list)}** favorite(s) to the queue! 🎶 {EMOJI_BLUSH}")
 
     async def select_song(self, interaction: discord.Interaction):
-        index = int(interaction.data["values"][0])
-        track = self.get_list()[index]
+        fav_list = self.get_list()
+        idx = int(interaction.data["values"][0])
+        selected_track = fav_list[idx]
+
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+            await interaction.response.send_message("You must be in a voice channel to play favorites!", ephemeral=True)
             return
 
         await interaction.response.defer()
+
         voice_channel = interaction.user.voice.channel
-        voice_client = interaction.guild.voice_client
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
+        vc = interaction.guild.voice_client
+        if not vc:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-        state["queue"].append({"title": track["title"], "webpage_url": track["url"]})
-        if not voice_client.is_playing() and not voice_client.is_paused():
+        state["queue"].append({
+            "title": selected_track["title"],
+            "webpage_url": selected_track["url"]
+        })
+
+        if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing **{track['title']}** from favorites! {EMOJI_DANCING}")
+            await self.ctx.send(f"Now playing from favorites: **{selected_track['title']}**! {EMOJI_DANCING}")
         else:
-            await self.ctx.send(f"Queued **{track['title']}** from favorites. {EMOJI_BLUSH}")
+            await self.ctx.send(f"Queued from favorites: **{selected_track['title']}** (Position #{len(state['queue'])}) {EMOJI_BLUSH}")
 
     async def remove_song(self, interaction: discord.Interaction):
-        index = int(interaction.data["values"][0])
-        favorites = self.get_list()
-        removed = favorites.pop(index)
-        save_favorites()
-        self.rebuild_ui()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-        await self.ctx.send(f"Removed **{removed['title']}** from favorites.", delete_after=5)
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("You cannot delete someone else's favorites!", ephemeral=True)
+            return
 
+        idx = int(interaction.data["values"][0])
+        fav_list = self.get_list()
+
+        if 0 <= idx < len(fav_list):
+            removed = fav_list.pop(idx)
+            save_favorites()
+            self.rebuild_ui()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            await self.ctx.send(f"Removed **{removed['title']}** from favorites.", delete_after=5)
+
+
+# ============================================================
+# PLAYLIST INTERACTIVE VIEW
+# ============================================================
 
 class PlaylistView(discord.ui.View):
     def __init__(self, ctx, pl_name: str, is_server: bool = False):
@@ -1072,55 +1355,61 @@ class PlaylistView(discord.ui.View):
         self.page = 0
         self.update_buttons()
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message(
-                "Only the command author can control this menu!",
-                ephemeral=True
-            )
-            return False
-        return True
-
     def get_tracks(self):
         if self.is_server:
             return playlists_data["guilds"].get(str(self.ctx.guild.id), {}).get(self.pl_name, [])
-        return playlists_data["users"].get(str(self.ctx.author.id), {}).get(self.pl_name, [])
+        else:
+            return playlists_data["users"].get(str(self.ctx.author.id), {}).get(self.pl_name, [])
 
     def get_embed(self):
         tracks = self.get_tracks()
-        kind = "Server" if self.is_server else "Personal"
-        embed = discord.Embed(title=f"📋 {self.pl_name} ({kind} Playlist)", color=discord.Color.blue())
+        tag = "🌐 Server Playlist" if self.is_server else "👤 Personal Playlist"
+        embed = discord.Embed(title=f"📋 {self.pl_name} ({tag})", color=discord.Color.blue())
+
         if not tracks:
             embed.description = "This playlist is currently empty!"
             return embed
 
-        page_size = 8
-        total_pages = max(1, (len(tracks) + page_size - 1) // page_size)
+        items_per_page = 8
+        total_pages = max(1, (len(tracks) + items_per_page - 1) // items_per_page)
         self.page = min(self.page, total_pages - 1)
-        start = self.page * page_size
-        embed.description = "\n".join(
-            f"`{index}.` [{sanitize_markdown(track['title'], max_len=50)}]({track['url']})"
-            for index, track in enumerate(tracks[start:start + page_size], start + 1)
-        )
+
+        start = self.page * items_per_page
+        end = start + items_per_page
+        current_slice = tracks[start:end]
+
+        lines = ""
+        for idx, t in enumerate(current_slice, start + 1):
+            clean_title = sanitize_markdown(t["title"], max_len=50)
+            lines += f"`{idx}.` [{clean_title}]({t['url']})\n"
+
+        embed.description = lines
         embed.set_footer(text=f"Page {self.page + 1} of {total_pages} • Total tracks: {len(tracks)}")
         return embed
 
     def update_buttons(self):
-        total_pages = max(1, (len(self.get_tracks()) + 7) // 8)
-        self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= total_pages - 1
+        tracks = self.get_tracks()
+        items_per_page = 8
+        total_pages = max(1, (len(tracks) + items_per_page - 1) // items_per_page)
+
+        self.prev_btn.disabled = (self.page <= 0)
+        self.next_btn.disabled = (self.page >= total_pages - 1)
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page -= 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        if self.page > 0:
+            self.page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page += 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        tracks = self.get_tracks()
+        total_pages = max(1, (len(tracks) + 7) // 8)
+        if self.page < total_pages - 1:
+            self.page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="▶️ Play Playlist", style=discord.ButtonStyle.success)
     async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1128,67 +1417,38 @@ class PlaylistView(discord.ui.View):
         if not tracks:
             await interaction.response.send_message("This playlist is empty!", ephemeral=True)
             return
+
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+            await interaction.response.send_message("You must be in a voice channel first!", ephemeral=True)
             return
 
         await interaction.response.defer()
+
         voice_channel = interaction.user.voice.channel
-        voice_client = interaction.guild.voice_client
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
+        vc = interaction.guild.voice_client
+        if not vc:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
 
         state = get_music_state(interaction.guild.id)
         state["text_channel"] = self.ctx.channel
-        state["queue"].extend({"title": track["title"], "webpage_url": track["url"]} for track in tracks)
-        if not voice_client.is_playing() and not voice_client.is_paused():
+
+        for item in tracks:
+            state["queue"].append({
+                "title": item["title"],
+                "webpage_url": item["url"]
+            })
+
+        if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
-            await self.ctx.send(f"Now playing playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶")
+            await self.ctx.send(f"Now playing playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_DANCING}")
         else:
-            await self.ctx.send(f"Queued playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶")
+            await self.ctx.send(f"Queued playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_BLUSH}")
 
 
 # ============================================================
-# EVENTS
-# ============================================================
-
-@bot.event
-async def on_ready():
-    print("=" * 50)
-    print(f"Logged in as: {bot.user}")
-    print(f"Bot ID: {bot.user.id}")
-    print(f"Version: {BOT_VERSION}")
-    print(f"Servers: {len(bot.guilds)}")
-    print("=" * 50)
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.id == bot.user.id:
-        return
-
-    for guild in bot.guilds:
-        if guild.voice_client and guild.voice_client.channel:
-            vc_channel = guild.voice_client.channel
-            non_bots = [m for m in vc_channel.members if not m.bot]
-            if len(non_bots) == 0:
-                await schedule_disconnect(guild.id, delay=60)
-            else:
-                cancel_disconnect(guild.id)
-
-
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    await bot.process_commands(message)
-
-
-# ============================================================
-# COMMANDS STILL LISTED IN THE HELP MENU
+# COMMANDS
 # ============================================================
 
 @bot.command()
@@ -1203,7 +1463,6 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     await ctx.send(f"**{member}** was kicked.\nReason: {reason}")
     await log_action(ctx.guild, f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1215,7 +1474,6 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     await member.ban(reason=reason)
     await ctx.send(f"**{member}** was banned.\nReason: {reason}")
     await log_action(ctx.guild, f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1230,7 +1488,6 @@ async def unban(ctx, user_id: int):
         return
     await ctx.send(f"**{user}** was unbanned.")
     await log_action(ctx.guild, f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1252,7 +1509,6 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
         f"Moderator: {ctx.author}\nReason: {reason}"
     )
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1260,7 +1516,6 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
 async def untimeout(ctx, member: discord.Member):
     await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
     await ctx.send(f"Timeout removed from **{member}**.")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1275,7 +1530,6 @@ async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
         f"⚠️ **Warning**\nUser: {member} ({member.id})\nModerator: {ctx.author}\n"
         f"Reason: {reason}\nTotal warnings: {len(warnings)}"
     )
-
 
 @bot.command()
 @commands.guild_only()
@@ -1296,7 +1550,6 @@ async def warnings(ctx, member: discord.Member):
         )
     await ctx.send(embed=embed)
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1304,7 +1557,6 @@ async def clearwarnings(ctx, member: discord.Member):
     data.get("warnings", {}).get(str(ctx.guild.id), {}).pop(str(member.id), None)
     save_data()
     await ctx.send(f"Cleared all warnings for **{member}**.")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1332,7 +1584,6 @@ async def purge(ctx, amount: int):
     await confirmation.delete(delay=5)
     await log_action(ctx.guild, f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {deleted_count}")
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1344,7 +1595,6 @@ async def slowmode(ctx, seconds: int):
     await ctx.channel.edit(slowmode_delay=seconds)
     await ctx.send(f"Slowmode set to `{seconds}` second(s).")
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1354,7 +1604,6 @@ async def lock(ctx):
     overwrite.send_messages = False
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
     await ctx.send("🔒 Channel locked.")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1366,7 +1615,6 @@ async def unlock(ctx):
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
     await ctx.send("🔓 Channel unlocked.")
 
-
 @bot.command()
 @commands.guild_only()
 @moderator_only()
@@ -1377,7 +1625,6 @@ async def nick(ctx, member: discord.Member, *, nickname=None):
         await ctx.send(f"Nickname changed for **{member}** to `{nickname}`.")
     else:
         await ctx.send(f"Nickname reset for **{member}**.")
-
 
 @bot.command()
 @commands.guild_only()
@@ -1392,7 +1639,6 @@ async def serverinfo(ctx):
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     await ctx.send(embed=embed)
-
 
 @bot.command()
 @commands.guild_only()
@@ -1410,14 +1656,12 @@ async def userinfo(ctx, member: discord.Member = None):
     embed.add_field(name="Top Role", value=member.top_role.mention)
     await ctx.send(embed=embed)
 
-
 @bot.command()
 async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
     embed = discord.Embed(title=f"{member}'s Avatar", color=member.color)
     embed.set_image(url=member.display_avatar.url)
     await ctx.send(embed=embed)
-
 
 @bot.command()
 @commands.guild_only()
@@ -1435,7 +1679,6 @@ async def banner(ctx, member: discord.Member = None):
     embed.set_image(url=user.banner.url)
     await ctx.send(embed=embed)
 
-
 @bot.command()
 async def furry(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -1447,7 +1690,6 @@ async def furry(ctx, member: discord.Member = None):
     else:
         message = f"Oh my! {member.mention} is **{percentage}%** furry! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
-
 
 @bot.command(aliases=["match"])
 async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
@@ -1466,7 +1708,6 @@ async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
         message = f"💖 **{percentage}%**!!! {user1.mention} and {user2.mention} are a perfect match! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-
 @bot.command()
 async def femboy(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -1479,7 +1720,6 @@ async def femboy(ctx, member: discord.Member = None):
         message = f"Oh my! {member.mention} is **{percentage}%** femboy! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-
 @bot.command()
 async def kiss(ctx, member: discord.Member = None):
     if not member:
@@ -1489,7 +1729,6 @@ async def kiss(ctx, member: discord.Member = None):
     else:
         message = f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}"
     await ctx.send(message)
-
 
 @bot.command()
 async def hug(ctx, member: discord.Member = None):
@@ -1501,7 +1740,6 @@ async def hug(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} gives {member.mention} a warm hug! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-
 @bot.command()
 async def punch(ctx, member: discord.Member = None):
     if not member:
@@ -1511,7 +1749,6 @@ async def punch(ctx, member: discord.Member = None):
     else:
         message = f"{ctx.author.mention} punches {member.mention}! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}"
     await ctx.send(message)
-
 
 @bot.command()
 async def attack(ctx, member: discord.Member = None):
@@ -1527,7 +1764,6 @@ async def attack(ctx, member: discord.Member = None):
         f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
     ]))
 
-
 @bot.command()
 async def boop(ctx, member: discord.Member = None):
     if not member:
@@ -1538,7 +1774,6 @@ async def boop(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}"
     await ctx.send(message)
 
-
 @bot.command()
 async def dance(ctx, member: discord.Member = None):
     if member:
@@ -1546,7 +1781,6 @@ async def dance(ctx, member: discord.Member = None):
     else:
         message = f"{ctx.author.mention} breaks into an energetic dance! {EMOJI_DANCING}"
     await ctx.send(message)
-
 
 async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: str):
     if not text or not text.strip():
@@ -1579,9 +1813,7 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
     try:
         with Image.open(asset_path) as image:
             font = get_meme_font(28, script_dir)
-            char_width = font.getlength("A") if hasattr(font, "getlength") else 15
-            chars_per_line = max(10, int((image.width - 24) / max(1, char_width)))
-            lines = textwrap.wrap(text.strip(), width=chars_per_line) or [text.strip()]
+            lines = _wrap_meme_text(text.strip(), image.width - 24, font, script_dir)
             line_height = 35
             caption_height = len(lines) * line_height + 24
             frames = []
@@ -1592,8 +1824,15 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
                 draw = ImageDraw.Draw(canvas)
                 y = (caption_height - len(lines) * line_height) // 2
                 for line in lines:
-                    line_width = font.getlength(line) if hasattr(font, "getlength") else draw.textlength(line, font=font)
-                    draw.text(((image.width - line_width) // 2, y), line, fill="black", font=font)
+                    line_width = _meme_text_width(line, font, script_dir)
+                    _draw_meme_text(
+                        draw,
+                        ((image.width - line_width) // 2, y),
+                        line,
+                        "black",
+                        font,
+                        script_dir
+                    )
                     y += line_height
                 frames.append(canvas.convert("RGB"))
 
@@ -1616,46 +1855,109 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
         if os.path.exists(output_path):
             os.remove(output_path)
 
-
 @bot.command()
 async def jarvis(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "jarvis.gif", "Jarvis", text)
-
 
 @bot.command()
 async def lowtiergod(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "lowtiergod.gif", "Low Tier God", text)
 
-
 @bot.command(aliases=["floating", "ascend", "sponge"])
 async def spongebob(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "spongebob.gif", "Spongebob Floating", text)
-
 
 @bot.command(aliases=["tuff", "hoodiebob", "sadbob"])
 async def tuffbob(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "tuffbob.gif", "Tuff Spongebob", text)
 
-
 @bot.command(aliases=["fanum", "food"])
 async def fanumfood(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "fanumfood.gif", "Fanum Food", text)
-
 
 @bot.command(aliases=["pilot", "crossview"])
 async def stephen(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "stephen.jpg", "Stephen", text)
 
-
 @bot.command(aliases=["reason", "heartbeats"])
 async def katanaman(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "reason.gif", "Katana Man", text)
-
 
 @bot.command(aliases=["yaoming", "cried"])
 async def basketball(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "basketball.gif", "Basketball", text)
 
+@bot.command()
+async def tryhard(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "tryhard.gif", "Tryhard", text)
+
+@bot.command()
+async def lockin(ctx, *, text: str = None):
+    if not text or "|" not in text:
+        await ctx.send(
+            f"Provide two captions separated by `|`.\n"
+            f"**Usage:** `{get_prefix(bot, ctx.message)}lockin <first caption> | <second caption>`"
+        )
+        return
+
+    first_caption, _, second_caption = text.partition("|")
+    captions = [first_caption.strip(), second_caption.strip()]
+    if not all(captions):
+        await ctx.send("Both captions are required, one on each side of `|`.")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(script_dir, "assets", "lockin.png")
+    if not os.path.isfile(template_path):
+        template_path = os.path.join(script_dir, "lockin.png")
+    if not os.path.isfile(template_path):
+        await ctx.send("**Error:** `lockin.png` was not found in the assets or bot folder.")
+        return
+
+    status = await ctx.send(f"Generating Lock In meme... please wait! {EMOJI_BOYKISSER_SEE}")
+    output_path = os.path.join(script_dir, f"lockin_{ctx.message.id}.gif")
+    try:
+        with Image.open(template_path) as source:
+            image = source.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        divider_x = image.width // 2
+        panel_bottom = int(image.height * 0.285)
+        panels = [
+            (24, 12, divider_x - 18, panel_bottom - 12),
+            (divider_x + 18, 12, image.width - 24, panel_bottom - 12),
+        ]
+
+        for caption, (left, top, right, bottom) in zip(captions, panels):
+            max_width = right - left
+            max_height = bottom - top
+            for font_size in range(52, 13, -2):
+                font = get_meme_font(font_size, script_dir)
+                wrapped = _wrap_meme_text(caption, max_width, font, script_dir)
+                line_height = int(font_size * 1.2)
+                widths = [_meme_text_width(line, font, script_dir) for line in wrapped]
+                if max(widths, default=0) <= max_width and len(wrapped) * line_height <= max_height:
+                    break
+
+            y = top + (max_height - len(wrapped) * line_height) // 2
+            for line, line_width in zip(wrapped, widths):
+                _draw_meme_text(
+                    draw,
+                    (left + (max_width - line_width) // 2, y),
+                    line,
+                    "black",
+                    font,
+                    script_dir
+                )
+                y += line_height
+
+        image.save(output_path, format="GIF")
+        await ctx.send(file=discord.File(output_path))
+        await status.delete()
+    except (OSError, ValueError, discord.HTTPException) as error:
+        await status.edit(content=f"Could not generate Lock In meme: `{error}`")
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
 @bot.command()
 @moderator_only()
@@ -1664,7 +1966,6 @@ async def announce(ctx, *, message):
     embed.set_footer(text=f"Posted by {ctx.author}")
     await ctx.send("@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
 
-
 @bot.command()
 @owner_only()
 @commands.guild_only()
@@ -1672,7 +1973,6 @@ async def setlog(ctx, channel: discord.TextChannel):
     data["logs"][str(ctx.guild.id)] = channel.id
     save_data()
     await ctx.send(f"Moderation logs will now be sent to {channel.mention}.")
-
 
 @bot.command()
 @owner_only()
@@ -1731,7 +2031,6 @@ class HelpPaginator(discord.ui.View):
                 await self.message.edit(view=self)
             except Exception:
                 pass
-
 
 @bot.command(name="help")
 async def help_command(ctx):
@@ -1823,6 +2122,8 @@ async def help_command(ctx):
             f"`{prefix}stephen <text>` — Caption the Stephen meme\n"
             f"`{prefix}katanaman <text>` — Fill the Katana Man manga panel\n"
             f"`{prefix}basketball <text>` — Yao Ming meme with any custom text\n"
+            f"`{prefix}tryhard <text>` — Caption the Tryhard meme GIF\n"
+            f"`{prefix}lockin <first caption> | <second caption>` — Caption both panels of the Lock In meme\n"
             f"`{prefix}quotethis` — Reply to a message with this command to quote it!"
         ),
         inline=False
@@ -1935,7 +2236,6 @@ async def disable(ctx, cmd_name: str, *, flag: str = ""):
         else:
             await ctx.send(f"Command `{real_name}` is already disabled in this server.")
 
-
 @bot.command()
 @owner_only()
 async def enable(ctx, cmd_name: str, *, flag: str = ""):
@@ -1985,7 +2285,6 @@ async def blacklist(ctx):
     )
     await ctx.send(embed=embed)
 
-
 @blacklist.command(name="add")
 @owner_only()
 async def blacklist_add(ctx, user: discord.User, cmd_name: str = None):
@@ -2016,7 +2315,6 @@ async def blacklist_add(ctx, user: discord.User, cmd_name: str = None):
             save_data()
             await ctx.send(f"Added **{user.name}** to the blacklist specifically for the `{real_name}` command.")
 
-
 @blacklist.command(name="remove")
 @owner_only()
 async def blacklist_remove(ctx, user: discord.User, cmd_name: str = None):
@@ -2045,7 +2343,6 @@ async def blacklist_remove(ctx, user: discord.User, cmd_name: str = None):
             await ctx.send(f"Removed **{user.name}** from the `{real_name}` blacklist.")
         else:
             await ctx.send(f"**{user.name}** is not blacklisted from `{real_name}`.")
-
 
 @blacklist.command(name="list")
 @owner_only()
@@ -2183,7 +2480,6 @@ async def play(ctx, *, query: str = None):
     if not voice_client.is_playing() and not voice_client.is_paused():
         await play_next_track(ctx.guild.id)
 
-
 @bot.command(aliases=["s", "next"])
 async def skip(ctx):
     vc = ctx.guild.voice_client
@@ -2193,7 +2489,6 @@ async def skip(ctx):
 
     vc.stop()
     await ctx.send(f"Skipped track! {EMOJI_BOYKISSER_RIGHT}")
-
 
 @bot.command(aliases=["replay"])
 async def restartsong(ctx):
@@ -2209,7 +2504,6 @@ async def restartsong(ctx):
     vc.stop()
     await ctx.send(f"Restarted **{current_track['title']}**! 🔄")
 
-
 @bot.command()
 async def pause(ctx):
     vc = ctx.guild.voice_client
@@ -2219,7 +2513,6 @@ async def pause(ctx):
     else:
         await ctx.send(f"Nothing is currently playing! {EMOJI_BOYKISSER_HUH}")
 
-
 @bot.command()
 async def resume(ctx):
     vc = ctx.guild.voice_client
@@ -2228,7 +2521,6 @@ async def resume(ctx):
         await ctx.send(f"Resumed playback! {EMOJI_DANCING}")
     else:
         await ctx.send(f"Playback is not paused! {EMOJI_BOYKISSER_HUH}")
-
 
 @bot.command()
 async def stop(ctx):
@@ -2246,13 +2538,11 @@ async def stop(ctx):
     await ctx.send(f"Stopped music and cleared the queue. {EMOJI_SHOCKED}")
     await schedule_disconnect(ctx.guild.id, delay=180)
 
-
 @bot.command(aliases=["q"])
 async def queue(ctx):
     view = InteractiveQueueView(ctx.guild.id)
     embed = view.get_embed()
     await ctx.send(embed=embed, view=view)
-
 
 @bot.command(aliases=["np"])
 async def nowplaying(ctx):
@@ -2278,7 +2568,6 @@ async def nowplaying(ctx):
     view = NowPlayingView(ctx.guild.id)
     await ctx.send(embed=embed, view=view)
 
-
 @bot.command(aliases=["vol"])
 async def volume(ctx, vol: int = None):
     state = get_music_state(ctx.guild.id)
@@ -2298,14 +2587,12 @@ async def volume(ctx, vol: int = None):
 
     await ctx.send(f"Volume adjusted to `{vol}%`. {EMOJI_BLUSH}")
 
-
 @bot.command()
 async def loop(ctx):
     state = get_music_state(ctx.guild.id)
     state["loop"] = not state["loop"]
     status = "enabled" if state["loop"] else "disabled"
     await ctx.send(f"Track looping is now **{status}**. {EMOJI_DANCING}")
-
 
 @bot.command(aliases=["effects", "filter"])
 async def effect(ctx, effect_name: str = None):
@@ -2338,7 +2625,6 @@ async def effect(ctx, effect_name: str = None):
     )
     view = EffectSelectView(ctx.guild.id)
     await ctx.send(embed=embed, view=view)
-
 
 @bot.command(aliases=["autorestartfx", "autorestarteffect"])
 async def autorestart(ctx):
@@ -2408,7 +2694,6 @@ async def favorite(ctx, *, query: str = None):
     save_favorites()
     await ctx.send(f"Saved **{clean_title}** to favorites! ❤️ {EMOJI_LOVE}")
 
-
 @bot.command(aliases=["favs"])
 async def favorites(ctx):
     view = FavoritesView(ctx, mode="guild")
@@ -2440,6 +2725,254 @@ async def playlist(ctx):
         color=discord.Color.blue()
     )
     await ctx.send(embed=embed)
+
+@bot.command()
+async def join(ctx):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send(f"You must be in a voice channel first! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    channel = ctx.author.voice.channel
+    voice_client = ctx.guild.voice_client
+
+    if voice_client:
+        await voice_client.move_to(channel)
+    else:
+        await channel.connect()
+
+    await ctx.send(f"Connected to **#{channel.name}**! {EMOJI_BOYKISSER_HAPPY}")
+
+@bot.command(aliases=["disconnect"])
+async def leave(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client:
+        state = get_music_state(ctx.guild.id)
+        state["queue"].clear()
+        state["current"] = None
+        state["loop"] = False
+        await update_vc_status(voice_client.channel, None)
+        await voice_client.disconnect()
+        music_states.pop(ctx.guild.id, None)
+        await ctx.send(f"Disconnected from voice channel. {EMOJI_BOYKISSER_SMOKING}")
+    else:
+        await ctx.send(f"I am not connected to any voice channel in this server. {EMOJI_BOYKISSER_HUH}")
+
+
+# ============================================================
+# QUOTE COMMAND
+# ============================================================
+
+@bot.command(aliases=["quote"])
+async def quotethis(ctx):
+    if not ctx.message.reference or not ctx.message.reference.message_id:
+        await ctx.send(f"You must reply to a message to quote it! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    try:
+        quoted_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+    except (discord.NotFound, discord.HTTPException):
+        await ctx.send(f"Could not retrieve the quoted message. {EMOJI_SHOCKED}")
+        return
+
+    embed = discord.Embed(
+        description=quoted_msg.content if quoted_msg.content else "*[No text content]*",
+        color=quoted_msg.author.color,
+        timestamp=quoted_msg.created_at
+    )
+    embed.set_author(
+        name=f"{quoted_msg.author.display_name} (@{quoted_msg.author.name})",
+        icon_url=quoted_msg.author.display_avatar.url,
+        url=quoted_msg.jump_url
+    )
+
+    if quoted_msg.attachments:
+        for attachment in quoted_msg.attachments:
+            if any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
+                embed.set_image(url=attachment.url)
+                break
+
+    embed.set_footer(text=f"Quoted by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+# ============================================================
+# DEVTEST MODE ISOLATION (DEVTEST / UNDEVTEST)
+# ============================================================
+
+@bot.command()
+@moderator_only()
+@commands.bot_has_permissions(manage_channels=True)
+async def devtest(ctx):
+    guild = ctx.guild
+    guild_id_str = str(guild.id)
+
+    if "devtest" not in data:
+        data["devtest"] = {}
+
+    if guild_id_str in data["devtest"]:
+        existing_id = data["devtest"][guild_id_str]
+        existing_channel = guild.get_channel(existing_id)
+        if existing_channel:
+            await ctx.send(
+                f"Kinetix is already locked to devtest in {existing_channel.mention}!\n"
+                f"Run `;undevtest` in that channel to unlock."
+            )
+            return
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+
+    test_channel = await guild.create_text_channel(
+        name="kinetix-devtest",
+        overwrites=overwrites,
+        topic="Temporary testing room for Kinetix. Use ;undevtest to delete.",
+        reason="Devtest isolation initiated"
+    )
+
+    data["devtest"][guild_id_str] = test_channel.id
+    save_data()
+
+    await test_channel.send(
+        f"🛠️ **Kinetix Devtest Activated**\n"
+        f"The bot is now completely locked to this channel to prevent chat flood.\n"
+        f"When testing is complete, run `{get_prefix(bot, ctx.message)}undevtest` here to delete this channel."
+    )
+
+    if ctx.channel.id != test_channel.id:
+        await ctx.send(f"Created {test_channel.mention} and locked bot activity there! {EMOJI_BOYKISSER_HAPPY}")
+
+@bot.command()
+@moderator_only()
+async def undevtest(ctx):
+    guild = ctx.guild
+    guild_id_str = str(guild.id)
+
+    locked_channel_id = data.get("devtest", {}).get(guild_id_str)
+
+    if not locked_channel_id:
+        await ctx.send(f"This server is not currently in devtest mode! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    locked_channel = guild.get_channel(locked_channel_id)
+
+    if locked_channel is None:
+        del data["devtest"][guild_id_str]
+        save_data()
+        await ctx.send("The devtest channel was already deleted. Devtest lockdown has been cleared! 🔓")
+        return
+
+    if ctx.channel.id != locked_channel_id:
+        await ctx.send(f"You must run `;undevtest` inside the active devtest channel ({locked_channel.mention})! {EMOJI_BOYKISSER_HUH}")
+        return
+
+    del data["devtest"][guild_id_str]
+    save_data()
+
+    await ctx.send(f"Devtest mode ended. Deleting channel in 3 seconds... {EMOJI_DANCING}")
+    await asyncio.sleep(3)
+    try:
+        await ctx.channel.delete(reason="Devtest session terminated.")
+    except discord.HTTPException:
+        pass
+
+
+# ============================================================
+# UTILITY
+# ============================================================
+
+@bot.command()
+async def ping(ctx):
+    latency = round(bot.latency * 1000)
+    await ctx.send(f"Pong! `{latency}ms`")
+
+@bot.command()
+async def botinfo(ctx):
+    embed = discord.Embed(
+        title="Bot Information",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="Version", value=f"`v{BOT_VERSION}`", inline=True)
+    embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=True)
+    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Users", value=len(bot.users), inline=True)
+    await ctx.send(embed=embed)
+
+
+# ============================================================
+# AUTOREPLY CONFIGURATION (DISABLED - REWORK SOON)
+# ============================================================
+
+@bot.group(invoke_without_command=True)
+@owner_only()
+async def autoreply(ctx):
+    embed = discord.Embed(
+        title="⚠️ Autoreply Feature Disabled",
+        description="The automatic reply system is currently **disabled** and getting a rework soon!",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text="Stay tuned for the upcoming update.")
+    await ctx.send(embed=embed)
+
+@autoreply.command(name="list")
+@owner_only()
+async def autoreply_list(ctx):
+    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
+
+@autoreply.command(name="add")
+@owner_only()
+async def autoreply_add(ctx, *, text: str):
+    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
+
+@autoreply.command(name="remove")
+@owner_only()
+async def autoreply_remove(ctx, index: int):
+    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
+
+@autoreply.command(name="cooldown")
+@owner_only()
+async def autoreply_cooldown(ctx, seconds: int):
+    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
+
+
+# ============================================================
+# PREFIX CONFIGURATION
+# ============================================================
+
+@bot.command()
+@owner_only()
+async def prefix(ctx, new_prefix=None):
+    if not new_prefix:
+        await ctx.send(f"Current prefix: `{get_prefix(bot, ctx.message)}`")
+        return
+
+    if len(new_prefix) > 5:
+        await ctx.send("The prefix cannot be longer than 5 characters.")
+        return
+
+    data["prefixes"][str(ctx.guild.id)] = new_prefix
+    save_data()
+    await ctx.send(f"Prefix changed to `{new_prefix}`.")
+
+
+# ============================================================
+# ERROR HANDLING
+# ============================================================
+
+@bot.command(aliases=["ap", "auto"])
+async def autoplay(ctx):
+    state = get_music_state(ctx.guild.id)
+    state["autoplay"] = not state.get("autoplay", False)
+    status = "enabled" if state["autoplay"] else "disabled"
+    
+    msg = f"📻 Autoplay is now **{status}**. "
+    if state["autoplay"]:
+        msg += f"When the queue ends, I will automatically play similar tracks! {EMOJI_DANCING}"
+    else:
+        msg += f"I will stop playing when the queue ends. {EMOJI_SHOCKED}"
+        
+    await ctx.send(msg)
 
 
 @playlist.command(name="create")
@@ -2656,242 +3189,41 @@ async def playlist_delete(ctx, pl_name: str, *, flag: str = ""):
     await ctx.send(f"Deleted playlist **{pl_name}**.")
 
 
-@bot.command()
-async def join(ctx):
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send(f"You must be in a voice channel first! {EMOJI_BOYKISSER_HUH}")
+# ============================================================
+# EVENTS
+# ============================================================
+
+@bot.event
+async def on_ready():
+    print("=" * 50)
+    print(f"Logged in as: {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print(f"Version: {BOT_VERSION}")
+    print(f"Servers: {len(bot.guilds)}")
+    print("=" * 50)
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.id == bot.user.id:
         return
 
-    channel = ctx.author.voice.channel
-    voice_client = ctx.guild.voice_client
-
-    if voice_client:
-        await voice_client.move_to(channel)
-    else:
-        await channel.connect()
-
-    await ctx.send(f"Connected to **#{channel.name}**! {EMOJI_BOYKISSER_HAPPY}")
-
-
-@bot.command(aliases=["disconnect"])
-async def leave(ctx):
-    voice_client = ctx.guild.voice_client
-    if voice_client:
-        state = get_music_state(ctx.guild.id)
-        state["queue"].clear()
-        state["current"] = None
-        state["loop"] = False
-        await update_vc_status(voice_client.channel, None)
-        await voice_client.disconnect()
-        music_states.pop(ctx.guild.id, None)
-        await ctx.send(f"Disconnected from voice channel. {EMOJI_BOYKISSER_SMOKING}")
-    else:
-        await ctx.send(f"I am not connected to any voice channel in this server. {EMOJI_BOYKISSER_HUH}")
+    for guild in bot.guilds:
+        if guild.voice_client and guild.voice_client.channel:
+            vc_channel = guild.voice_client.channel
+            non_bots = [m for m in vc_channel.members if not m.bot]
+            if len(non_bots) == 0:
+                await schedule_disconnect(guild.id, delay=60)
+            else:
+                cancel_disconnect(guild.id)
 
 
-# ============================================================
-# QUOTE COMMAND
-# ============================================================
-
-@bot.command(aliases=["quote"])
-async def quotethis(ctx):
-    if not ctx.message.reference or not ctx.message.reference.message_id:
-        await ctx.send(f"You must reply to a message to quote it! {EMOJI_BOYKISSER_HUH}")
+@bot.event
+async def on_message(message):
+    if message.author.bot:
         return
 
-    try:
-        quoted_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-    except (discord.NotFound, discord.HTTPException):
-        await ctx.send(f"Could not retrieve the quoted message. {EMOJI_SHOCKED}")
-        return
-
-    embed = discord.Embed(
-        description=quoted_msg.content if quoted_msg.content else "*[No text content]*",
-        color=quoted_msg.author.color,
-        timestamp=quoted_msg.created_at
-    )
-    embed.set_author(
-        name=f"{quoted_msg.author.display_name} (@{quoted_msg.author.name})",
-        icon_url=quoted_msg.author.display_avatar.url,
-        url=quoted_msg.jump_url
-    )
-
-    if quoted_msg.attachments:
-        for attachment in quoted_msg.attachments:
-            if any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
-                embed.set_image(url=attachment.url)
-                break
-
-    embed.set_footer(text=f"Quoted by {ctx.author.display_name}")
-    await ctx.send(embed=embed)
-
-
-# ============================================================
-# DEVTEST MODE ISOLATION (DEVTEST / UNDEVTEST)
-# ============================================================
-
-@bot.command()
-@moderator_only()
-@commands.bot_has_permissions(manage_channels=True)
-async def devtest(ctx):
-    guild = ctx.guild
-    guild_id_str = str(guild.id)
-
-    if "devtest" not in data:
-        data["devtest"] = {}
-
-    if guild_id_str in data["devtest"]:
-        existing_id = data["devtest"][guild_id_str]
-        existing_channel = guild.get_channel(existing_id)
-        if existing_channel:
-            await ctx.send(
-                f"Kinetix is already locked to devtest in {existing_channel.mention}!\n"
-                f"Run `;undevtest` in that channel to unlock."
-            )
-            return
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
-    }
-
-    test_channel = await guild.create_text_channel(
-        name="kinetix-devtest",
-        overwrites=overwrites,
-        topic="Temporary testing room for Kinetix. Use ;undevtest to delete.",
-        reason="Devtest isolation initiated"
-    )
-
-    data["devtest"][guild_id_str] = test_channel.id
-    save_data()
-
-    await test_channel.send(
-        f"🛠️ **Kinetix Devtest Activated**\n"
-        f"The bot is now completely locked to this channel to prevent chat flood.\n"
-        f"When testing is complete, run `{get_prefix(bot, ctx.message)}undevtest` here to delete this channel."
-    )
-
-    if ctx.channel.id != test_channel.id:
-        await ctx.send(f"Created {test_channel.mention} and locked bot activity there! {EMOJI_BOYKISSER_HAPPY}")
-
-
-@bot.command()
-@moderator_only()
-async def undevtest(ctx):
-    guild = ctx.guild
-    guild_id_str = str(guild.id)
-
-    locked_channel_id = data.get("devtest", {}).get(guild_id_str)
-
-    if not locked_channel_id:
-        await ctx.send(f"This server is not currently in devtest mode! {EMOJI_BOYKISSER_HUH}")
-        return
-
-    locked_channel = guild.get_channel(locked_channel_id)
-
-    if locked_channel is None:
-        del data["devtest"][guild_id_str]
-        save_data()
-        await ctx.send("The devtest channel was already deleted. Devtest lockdown has been cleared! 🔓")
-        return
-
-    if ctx.channel.id != locked_channel_id:
-        await ctx.send(f"You must run `;undevtest` inside the active devtest channel ({locked_channel.mention})! {EMOJI_BOYKISSER_HUH}")
-        return
-
-    del data["devtest"][guild_id_str]
-    save_data()
-
-    await ctx.send(f"Devtest mode ended. Deleting channel in 3 seconds... {EMOJI_DANCING}")
-    await asyncio.sleep(3)
-    try:
-        await ctx.channel.delete(reason="Devtest session terminated.")
-    except discord.HTTPException:
-        pass
-
-
-# ============================================================
-# UTILITY
-# ============================================================
-
-@bot.command()
-async def ping(ctx):
-    latency = round(bot.latency * 1000)
-    await ctx.send(f"Pong! `{latency}ms`")
-
-
-@bot.command()
-async def botinfo(ctx):
-    embed = discord.Embed(
-        title="Bot Information",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(name="Version", value=f"`v{BOT_VERSION}`", inline=True)
-    embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=True)
-    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
-    embed.add_field(name="Users", value=len(bot.users), inline=True)
-    await ctx.send(embed=embed)
-
-
-# ============================================================
-# AUTOREPLY CONFIGURATION (DISABLED - REWORK SOON)
-# ============================================================
-
-@bot.group(invoke_without_command=True)
-@owner_only()
-async def autoreply(ctx):
-    embed = discord.Embed(
-        title="⚠️ Autoreply Feature Disabled",
-        description="The automatic reply system is currently **disabled** and getting a rework soon!",
-        color=discord.Color.orange()
-    )
-    embed.set_footer(text="Stay tuned for the upcoming update.")
-    await ctx.send(embed=embed)
-
-
-@autoreply.command(name="list")
-@owner_only()
-async def autoreply_list(ctx):
-    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
-
-
-@autoreply.command(name="add")
-@owner_only()
-async def autoreply_add(ctx, *, text: str):
-    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
-
-
-@autoreply.command(name="remove")
-@owner_only()
-async def autoreply_remove(ctx, index: int):
-    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
-
-
-@autoreply.command(name="cooldown")
-@owner_only()
-async def autoreply_cooldown(ctx, seconds: int):
-    await ctx.send("Autoreply is currently disabled for an upcoming rework.")
-
-
-# ============================================================
-# PREFIX CONFIGURATION
-# ============================================================
-
-@bot.command()
-@owner_only()
-async def prefix(ctx, new_prefix=None):
-    if not new_prefix:
-        await ctx.send(f"Current prefix: `{get_prefix(bot, ctx.message)}`")
-        return
-
-    if len(new_prefix) > 5:
-        await ctx.send("The prefix cannot be longer than 5 characters.")
-        return
-
-    data["prefixes"][str(ctx.guild.id)] = new_prefix
-    save_data()
-    await ctx.send(f"Prefix changed to `{new_prefix}`.")
-
+    await bot.process_commands(message)
 
 # ============================================================
 # ERROR HANDLING
