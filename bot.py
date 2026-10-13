@@ -555,17 +555,85 @@ async def devtest_lock_check(ctx):
 # LOGGING
 # ============================================================
 
-async def log_action(guild, message):
+purge_log_suppression = set()
+
+async def log_action(
+    guild,
+    title: str,
+    *,
+    actor=None,
+    target=None,
+    details=None,
+    color=discord.Color.orange(),
+    timestamp=None
+):
     channel_id = data["logs"].get(str(guild.id))
     if not channel_id:
         return
 
     channel = guild.get_channel(channel_id)
-    if channel:
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title=title,
+        color=color,
+        timestamp=timestamp or discord.utils.utcnow()
+    )
+    if actor is not None:
+        embed.add_field(name="Moderator / Actor", value=f"{actor.mention} (`{actor}` · `{actor.id}`)", inline=False)
+    if target is not None:
+        embed.add_field(name="Target", value=f"{target.mention} (`{target}` · `{target.id}`)", inline=False)
+    for name, value in (details or {}).items():
+        value = str(value)
+        if len(value) > 1024:
+            value = value[:1021] + "..."
+        embed.add_field(name=name, value=value or "—", inline=False)
+    embed.set_footer(text=f"{guild.name} • Moderation & message logs")
+
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"[Log Delivery Error in {guild}]: {error}")
+
+
+async def find_message_delete_actor(guild, *, target_id=None, channel_id, bulk=False, count=None):
+    audit_action = (
+        discord.AuditLogAction.message_bulk_delete
+        if bulk else discord.AuditLogAction.message_delete
+    )
+    cutoff = discord.utils.utcnow() - timedelta(seconds=10)
+    for attempt in range(2):
         try:
-            await channel.send(message)
-        except discord.HTTPException:
-            pass
+            async for entry in guild.audit_logs(limit=10, action=audit_action):
+                if entry.created_at < cutoff:
+                    continue
+                extra_channel = getattr(getattr(entry, "extra", None), "channel", None)
+                if not extra_channel or extra_channel.id != channel_id:
+                    continue
+                if bulk:
+                    entry_count = getattr(entry.extra, "count", None)
+                    if count is not None and entry_count != count:
+                        continue
+                elif target_id is not None:
+                    entry_target_id = getattr(entry.target, "id", None)
+                    if entry_target_id != target_id:
+                        continue
+                return entry.user
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"[Audit Log Lookup Error in {guild}]: {error}")
+            return None
+        if attempt == 0:
+            await asyncio.sleep(0.5)
+    return None
+
+
+def format_deleted_message(message):
+    content = message.content or "[no text content]"
+    attachments = ", ".join(attachment.filename for attachment in message.attachments)
+    if attachments:
+        content += f" [Attachments: {attachments}]"
+    return f"{message.author} (`{message.author.id}`): {content}"
 
 
 # ============================================================
@@ -666,7 +734,8 @@ EFFECT_FILTERS = {
     "none": None,
     "reverb": "aecho=0.8:0.88:60:0.4",
     "bassboost": "bass=g=10:f=110:w=0.6",
-    "bitcrusher": "equalizer=f=50:width_type=h:width=50:g=10",
+    "superbassboost": "bass=g=20:f=110:w=0.6",
+    "very_loud": "acrusher=level_in=8:level_out=18:bits=8:mode=log,volume=-24dB",
     "nightcore": "asetrate=48000*1.25,aresample=48000",
     "vaporwave": "asetrate=48000*0.8,aresample=48000",
     "8d": "apulsator=hz=0.125",
@@ -898,8 +967,9 @@ class EffectSelectView(discord.ui.View):
         options = [
             discord.SelectOption(label="None", value="none", description="Normal playback without filters", emoji="🎵", default=(current == "none")),
             discord.SelectOption(label="Reverb", value="reverb", description="Ambient spacious reverb", emoji="🌌", default=(current == "reverb")),
-            discord.SelectOption(label="Bassboost", value="bassboost", description="Punchy low-end bass filter", emoji="🔊", default=(current == "bassboost")),
-            discord.SelectOption(label="Bitcrusher", value="bitcrusher", description="Boosted 50 Hz equalizer effect", emoji="🎛️", default=(current == "bitcrusher")),
+            discord.SelectOption(label="Bassboost", value="bassboost", description="Punchy low-end bass filter", emoji="🔉", default=(current == "bassboost")),
+            discord.SelectOption(label="Super Bassboost", value="superbassboost", description="Extra-strong low-end bass boost", emoji="🔊", default=(current == "superbassboost")),
+            discord.SelectOption(label="VERY LOUD", value="very_loud", description="Crunchy, reduced-level distortion", emoji="📢", default=(current == "very_loud")),
             discord.SelectOption(label="Nightcore", value="nightcore", description="Sped up with raised pitch", emoji="⚡", default=(current == "nightcore")),
             discord.SelectOption(label="Vaporwave", value="vaporwave", description="Slowed down with deeper pitch", emoji="🌆", default=(current == "vaporwave")),
             discord.SelectOption(label="8D Audio", value="8d", description="Dynamic ear-to-ear panning", emoji="🎧", default=(current == "8d")),
@@ -1470,7 +1540,10 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
         return
     await member.kick(reason=reason)
     await ctx.send(f"**{member}** was kicked.\nReason: {reason}")
-    await log_action(ctx.guild, f"🔨 **Kick**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
+    await log_action(
+        ctx.guild, "Member Kicked", actor=ctx.author, target=member,
+        details={"Reason": reason}, color=discord.Color.red()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1482,7 +1555,10 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
         return
     await member.ban(reason=reason)
     await ctx.send(f"**{member}** was banned.\nReason: {reason}")
-    await log_action(ctx.guild, f"🔨 **Ban**\nUser: {member} ({member.id})\nModerator: {ctx.author}\nReason: {reason}")
+    await log_action(
+        ctx.guild, "Member Banned", actor=ctx.author, target=member,
+        details={"Reason": reason}, color=discord.Color.red()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1496,7 +1572,10 @@ async def unban(ctx, user_id: int):
         await ctx.send("That user is not banned.")
         return
     await ctx.send(f"**{user}** was unbanned.")
-    await log_action(ctx.guild, f"🔓 **Unban**\nUser: {user} ({user.id})\nModerator: {ctx.author}")
+    await log_action(
+        ctx.guild, "Member Unbanned", actor=ctx.author, target=user,
+        color=discord.Color.green()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1514,8 +1593,11 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
     await ctx.send(f"**{member}** was timed out for `{minutes}` minute(s).\nReason: {reason}")
     await log_action(
         ctx.guild,
-        f"⏱️ **Timeout**\nUser: {member} ({member.id})\nDuration: {minutes} minutes\n"
-        f"Moderator: {ctx.author}\nReason: {reason}"
+        "Member Timed Out",
+        actor=ctx.author,
+        target=member,
+        details={"Duration": f"{minutes} minute(s)", "Reason": reason},
+        color=discord.Color.orange()
     )
 
 @bot.command()
@@ -1525,6 +1607,10 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
 async def untimeout(ctx, member: discord.Member):
     await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
     await ctx.send(f"Timeout removed from **{member}**.")
+    await log_action(
+        ctx.guild, "Member Timeout Removed", actor=ctx.author, target=member,
+        color=discord.Color.green()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1536,8 +1622,11 @@ async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
     await ctx.send(f"⚠️ **{member}** has been warned.\nReason: {reason}\nTotal warnings: `{len(warnings)}`")
     await log_action(
         ctx.guild,
-        f"⚠️ **Warning**\nUser: {member} ({member.id})\nModerator: {ctx.author}\n"
-        f"Reason: {reason}\nTotal warnings: {len(warnings)}"
+        "Member Warned",
+        actor=ctx.author,
+        target=member,
+        details={"Reason": reason, "Total warnings": len(warnings)},
+        color=discord.Color.orange()
     )
 
 @bot.command()
@@ -1566,6 +1655,10 @@ async def clearwarnings(ctx, member: discord.Member):
     data.get("warnings", {}).get(str(ctx.guild.id), {}).pop(str(member.id), None)
     save_data()
     await ctx.send(f"Cleared all warnings for **{member}**.")
+    await log_action(
+        ctx.guild, "Member Warnings Cleared", actor=ctx.author, target=member,
+        color=discord.Color.orange()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1576,22 +1669,50 @@ async def purge(ctx, amount: int):
         await ctx.send("Amount must be greater than 0.")
         return
 
+    expected_deleted_ids = []
     try:
+        expected_deleted_ids = [
+            message.id
+            async for message in ctx.channel.history(limit=amount + 1)
+        ]
+        purge_log_suppression.update(expected_deleted_ids)
         deleted = await ctx.channel.purge(
             limit=amount + 1,
             reason=f"Message purge requested by {ctx.author} ({ctx.author.id})"
         )
     except discord.Forbidden:
+        purge_log_suppression.difference_update(expected_deleted_ids)
         await ctx.send("I need Manage Messages and Read Message History permissions to purge this channel.")
         return
     except discord.HTTPException as error:
+        purge_log_suppression.difference_update(expected_deleted_ids)
         await ctx.send(f"Discord could not complete the purge: `{error}`")
         return
+
+    deleted_ids = {message.id for message in deleted}
+    purge_log_suppression.difference_update(set(expected_deleted_ids) - deleted_ids)
+    purge_log_suppression.update(deleted_ids)
 
     deleted_count = sum(message.id != ctx.message.id for message in deleted)
     confirmation = await ctx.send(f"Deleted `{deleted_count}` message(s).")
     await confirmation.delete(delay=5)
-    await log_action(ctx.guild, f"🧹 **Purge**\nModerator: {ctx.author}\nMessages: {deleted_count}")
+    transcript = "\n".join(format_deleted_message(message) for message in deleted)
+    transcript_chunks = [
+        transcript[index:index + 950]
+        for index in range(0, len(transcript), 950)
+    ] or ["No message content was available."]
+    for index, chunk in enumerate(transcript_chunks, start=1):
+        await log_action(
+            ctx.guild,
+            "Messages Purged" if index == 1 else f"Messages Purged (continued {index})",
+            actor=ctx.author,
+            details={
+                "Channel": ctx.channel.mention,
+                "Deleted messages": deleted_count,
+                "Message content": chunk,
+            },
+            color=discord.Color.orange()
+        )
 
 @bot.command()
 @commands.guild_only()
@@ -1603,6 +1724,11 @@ async def slowmode(ctx, seconds: int):
         return
     await ctx.channel.edit(slowmode_delay=seconds)
     await ctx.send(f"Slowmode set to `{seconds}` second(s).")
+    await log_action(
+        ctx.guild, "Channel Slowmode Changed", actor=ctx.author,
+        details={"Channel": ctx.channel.mention, "Slowmode": f"{seconds} second(s)"},
+        color=discord.Color.orange()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1613,6 +1739,10 @@ async def lock(ctx):
     overwrite.send_messages = False
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
     await ctx.send("🔒 Channel locked.")
+    await log_action(
+        ctx.guild, "Channel Locked", actor=ctx.author,
+        details={"Channel": ctx.channel.mention}, color=discord.Color.orange()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1623,6 +1753,10 @@ async def unlock(ctx):
     overwrite.send_messages = None
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
     await ctx.send("🔓 Channel unlocked.")
+    await log_action(
+        ctx.guild, "Channel Unlocked", actor=ctx.author,
+        details={"Channel": ctx.channel.mention}, color=discord.Color.green()
+    )
 
 @bot.command()
 @commands.guild_only()
@@ -1630,6 +1764,11 @@ async def unlock(ctx):
 @commands.bot_has_permissions(manage_nicknames=True)
 async def nick(ctx, member: discord.Member, *, nickname=None):
     await member.edit(nick=nickname, reason=f"Nickname changed by {ctx.author}")
+    await log_action(
+        ctx.guild, "Member Nickname Changed", actor=ctx.author, target=member,
+        details={"New nickname": nickname or "Reset to account name"},
+        color=discord.Color.orange()
+    )
     if nickname:
         await ctx.send(f"Nickname changed for **{member}** to `{nickname}`.")
     else:
@@ -1978,6 +2117,11 @@ async def announce(ctx, *, message):
     embed = discord.Embed(title="Announcement", description=message, color=discord.Color.blurple())
     embed.set_footer(text=f"Posted by {ctx.author}")
     await ctx.send("@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
+    await log_action(
+        ctx.guild, "Announcement Posted", actor=ctx.author,
+        details={"Channel": ctx.channel.mention, "Announcement": message},
+        color=discord.Color.blurple()
+    )
 
 @bot.command()
 @owner_only()
@@ -3300,6 +3444,158 @@ async def on_voice_state_update(member, before, after):
             else:
                 cancel_disconnect(guild.id)
 
+@bot.event
+async def on_message_edit(before, after):
+    if after.guild is None or before.author.bot:
+        return
+    if (
+        before.content == after.content
+        and before.attachments == after.attachments
+        and before.embeds == after.embeds
+    ):
+        return
+
+    details = {
+        "Channel": after.channel.mention,
+        "Message ID": after.id,
+        "Before": before.content or "[no text content]",
+        "After": after.content or "[no text content]",
+    }
+    if before.attachments != after.attachments:
+        details["Attachments"] = (
+            f"Before: {', '.join(item.filename for item in before.attachments) or 'none'}\n"
+            f"After: {', '.join(item.filename for item in after.attachments) or 'none'}"
+        )
+    if before.embeds != after.embeds:
+        details["Embeds"] = f"Changed from {len(before.embeds)} embed(s) to {len(after.embeds)} embed(s)."
+    await log_action(
+        after.guild,
+        "Message Edited",
+        actor=after.author,
+        details=details,
+        color=discord.Color.blue(),
+        timestamp=after.edited_at
+    )
+
+@bot.event
+async def on_raw_message_edit(payload):
+    if payload.cached_message is not None or payload.guild_id is None:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    raw_author = payload.data.get("author") or {}
+    author_id = raw_author.get("id")
+    if raw_author.get("bot"):
+        return
+    author = bot.get_user(int(author_id)) if author_id else None
+    details = {
+        "Channel ID": payload.channel_id,
+        "Message ID": payload.message_id,
+        "Before": "Previous content was not available in the bot's message cache.",
+        "After": payload.data.get("content") or "[no text content]",
+    }
+    if author is None and author_id:
+        details["Actor"] = f"<@{author_id}> (`{author_id}`)"
+    await log_action(
+        guild,
+        "Message Edited (not cached)",
+        actor=author,
+        details=details,
+        color=discord.Color.blue()
+    )
+
+@bot.event
+async def on_raw_message_delete(payload):
+    if payload.guild_id is None:
+        return
+    if payload.message_id in purge_log_suppression:
+        purge_log_suppression.discard(payload.message_id)
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    message = payload.cached_message
+    target_id = message.author.id if message else None
+    actor = await find_message_delete_actor(
+        guild,
+        target_id=target_id,
+        channel_id=payload.channel_id
+    )
+    details = {
+        "Channel": getattr(message.channel, "mention", f"`{payload.channel_id}`") if message else f"`{payload.channel_id}`",
+        "Message ID": payload.message_id,
+        "Content": format_deleted_message(message) if message else "Message content was not available in the bot's cache.",
+    }
+    if actor is None:
+        details["Actor"] = "Unknown (no matching Discord audit-log entry was available)."
+    await log_action(
+        guild,
+        "Message Deleted",
+        actor=actor,
+        target=message.author if message else None,
+        details=details,
+        color=discord.Color.red(),
+        timestamp=message.created_at if message else None
+    )
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    if payload.guild_id is None:
+        return
+
+    message_ids = set(payload.message_ids)
+    suppressed_ids = message_ids & purge_log_suppression
+    purge_log_suppression.difference_update(suppressed_ids)
+    remaining_ids = message_ids - suppressed_ids
+    if not remaining_ids:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    cached_messages = [
+        message
+        for message in payload.cached_messages
+        if message.id in remaining_ids
+    ]
+    actor = await find_message_delete_actor(
+        guild,
+        channel_id=payload.channel_id,
+        bulk=True,
+        count=len(message_ids)
+    )
+    transcript = "\n".join(format_deleted_message(message) for message in cached_messages)
+    if len(cached_messages) < len(remaining_ids):
+        unavailable_count = len(remaining_ids) - len(cached_messages)
+        transcript += (
+            f"\n[{unavailable_count} message(s) were not cached; "
+            f"IDs: {', '.join(str(message_id) for message_id in sorted(remaining_ids) if message_id not in {m.id for m in cached_messages})}]"
+        )
+    chunks = [
+        transcript[index:index + 950]
+        for index in range(0, len(transcript), 950)
+    ] or ["No message content was available."]
+    for index, chunk in enumerate(chunks, start=1):
+        details = {
+            "Channel ID": payload.channel_id,
+            "Deleted message count": len(remaining_ids),
+            "Message content": chunk,
+        }
+        if actor is None:
+            details["Actor"] = "Unknown (no matching Discord audit-log entry was available)."
+        await log_action(
+            guild,
+            "Messages Bulk Deleted" if index == 1 else f"Messages Bulk Deleted (continued {index})",
+            actor=actor,
+            details=details,
+            color=discord.Color.red()
+        )
 
 @bot.event
 async def on_message(message):

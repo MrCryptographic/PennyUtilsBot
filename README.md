@@ -68,6 +68,12 @@ These commands are restricted to the moderator IDs configured in `bot.py`.
 Commands guarded by Discord permission checks also require Penny to have those
 permissions.
 
+Moderation actions, message edits/deletions, and purge transcripts are sent to
+the server's configured log channel (`;setlog #channel`). Give Penny **View
+Audit Log** permission so deletion logs can identify the moderator who removed
+a message; if Discord does not provide a matching audit entry, the log marks
+the actor as unknown. Message contents may be included in these logs.
+
 | Command | Description |
 | --- | --- |
 | `;kick @member [reason]` | Kick a member. |
@@ -78,7 +84,7 @@ permissions.
 | `;warn @member [reason]` | Add a persistent warning. |
 | `;warnings @member` | Show a member's warnings. |
 | `;clearwarnings @member` | Clear a member's warnings. |
-| `;purge <amount>` | Delete the requested number of recent messages. |
+| `;purge <amount>` | Delete recent messages and include their cached contents in the log transcript. |
 | `;slowmode <seconds>` | Set channel slowmode (0–21600 seconds). |
 | `;lock` / `;unlock` | Disable or restore sending messages for the default role in this channel. |
 | `;nick @member [nickname]` | Set or reset a member's nickname. |
@@ -167,7 +173,7 @@ be in a voice channel; Penny also needs the required voice-channel permissions.
 | `;nowplaying` | `;np` | Show the current track and interactive player controls. |
 | `;volume [1-100]` | `;vol` | Show or set playback volume. |
 | `;loop` | — | Toggle looping of the current track. |
-| `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `bitcrusher`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
+| `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `superbassboost`, `very_loud`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
 | `;autorestart` | `;autorestartfx`, `;autorestarteffect` | Toggle restarting the current track when an effect changes. |
 | `;autoplay` | `;ap`, `;auto` | Toggle automatic related-track playback when the queue ends. |
 | `;favorite [search query or URL]` | `;fav` | Save the current track, or look up and save a supplied track. Favorites are saved to both this server and your personal list. |
