@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PennyUtils | Discord Bot</title>
+    <style>
+        :root {
+            --bg-color: #1e1e24;
+            --container-bg: #2b2b36;
+            --text-color: #dcddde;
+            --accent-color: #5865F2; /* Discord Blurple */
+            --heading-color: #ffffff;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }
+        header {
+            background-color: var(--container-bg);
+            padding: 2rem 0;
+            text-align: center;
+            border-bottom: 3px solid var(--accent-color);
+        }
+        header h1 {
+            color: var(--heading-color);
+            margin: 0;
+            font-size: 2.5rem;
+        }
+        header p {
+            font-size: 1.2rem;
+            color: #a3a6aa;
+        }
+        nav {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            padding: 15px;
+            background: #18181c;
+        }
+        nav a {
+            color: var(--text-color);
+            text-decoration: none;
+            font-weight: bold;
+            transition: color 0.2s;
+        }
+        nav a:hover {
+            color: var(--accent-color);
+        }
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+        .card {
+            background-color: var(--container-bg);
+            padding: 30px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        h2 {
+            color: var(--heading-color);
+            border-bottom: 2px solid var(--accent-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+        h3 {
+            color: #c9cdd2;
+        }
+        a {
+            color: var(--accent-color);
+        }
+        footer {
+            text-align: center;
+            padding: 20px;
+            font-size: 0.9rem;
+            color: #72767d;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>PennyUtils</h1>
+        <p>The ultimate multi-purpose music, meme, and AI companion bot.</p>
+    </header>
+
+    <nav>
+        <a href="#about">About</a>
+        <a href="#privacy">Privacy Policy</a>
+        <a href="#terms">Terms of Service</a>
+    </nav>
+
+    <div class="container">
+        <!-- ABOUT SECTION -->
+        <div id="about" class="card">
+            <h2>About Penny</h2>
+            <p>PennyUtils (or just Penny) is a feature-rich Discord bot designed to bring interactive music streaming, dynamic meme generation, local AI chatting, and moderation utilities to your server.</p>
+        </div>
+
+        <!-- PRIVACY POLICY SECTION -->
+        <div id="privacy" class="card">
+            <h2>Privacy Policy</h2>
+            <p><strong>Last Updated:</strong> October 13, 2026</p>
+            
+            <h3>1. What Data We Collect</h3>
+            <p>PennyUtils collects the minimum amount of data necessary to function. We store:</p>
+            <ul>
+                <li><strong>Discord User IDs & Guild (Server) IDs:</strong> Used to track warnings, custom playlists, favorites, command blacklists, and server configurations.</li>
+                <li><strong>Chat History (Temporary):</strong> When interacting with the AI chat feature, the last 10 messages of your conversation are kept in temporary system memory to maintain conversational context. This is cleared upon bot restart or when you use the clear command.</li>
+                <li><strong>Command Usage:</strong> We log command usage locally to monitor bot performance and prevent spam/abuse.</li>
+            </ul>
+
+            <h3>2. How We Use Your Data</h3>
+            <p>Data is strictly used to provide the bot's intended features to you (e.g., fetching your saved playlists, applying moderation rules). PennyUtils relies on a local, self-hosted AI model (via LM Studio); your chat data is <strong>never</strong> sent to third-party corporate APIs like OpenAI or Google.</p>
+
+            <h3>3. Data Storage and Security</h3>
+            <p>All data is stored in local JSON files (`bot_data.json`, `favorites.json`, `playlists.json`) on the host machine. We do not sell, rent, or share your data with any third parties.</p>
+
+            <h3>4. Data Deletion</h3>
+            <p>You have the right to request the deletion of your data (User ID, saved playlists, favorites, and warnings). To do so, please contact the bot developer.</p>
+        </div>
+
+        <!-- TERMS OF SERVICE SECTION -->
+        <div id="terms" class="card">
+            <h2>Terms of Service</h2>
+            <p><strong>Last Updated:</strong> October 13, 2026</p>
+
+            <h3>1. Acceptance of Terms</h3>
+            <p>By inviting PennyUtils to your Discord server or using its commands, you agree to these Terms of Service and the Discord Developer Terms of Service.</p>
+
+            <h3>2. Usage Restrictions</h3>
+            <p>You agree not to:</p>
+            <ul>
+                <li>Use the bot to generate illegal, highly offensive, or severely abusive content.</li>
+                <li>Intentionally spam commands to lag or crash the bot. (An automatic anti-spam timeout system is in place).</li>
+                <li>Exploit bugs or vulnerabilities in the bot's code.</li>
+            </ul>
+
+            <h3>3. Service Availability</h3>
+            <p>PennyUtils is provided on an "AS IS" and "AS AVAILABLE" basis. The developer makes no guarantees regarding 100% uptime, data persistence, or bug-free operation. Playlists and favorites may be lost during data migrations or hardware failures.</p>
+
+            <h3>4. Right to Terminate</h3>
+            <p>The developer reserves the right to blacklist any user or restrict the bot from operating in any server at their sole discretion, at any time, without prior notice.</p>
+        </div>
+    </div>
+
+    <footer>
+        &copy; 2026 PennyUtils. All rights reserved.
+    </footer>
+
+</body>
+</html>

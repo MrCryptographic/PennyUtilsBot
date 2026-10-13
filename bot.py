@@ -613,6 +613,13 @@ async def chat(ctx, *, message: str = None):
 
     history = user_chat_history[user_id][-10:]
 
+    if persona_name == "superuncensored" and not history:
+        await ctx.send(
+            "⚠️ **Content warning:** The `superuncensored` persona may use strong "
+            "language or generate offensive and inappropriate content. It is "
+            "not suitable for all audiences."
+        )
+
     async with ctx.typing():
         response = await ai_chat.generate_response(message, persona=persona_name, history=history)
 
@@ -2189,7 +2196,7 @@ async def help_command(ctx):
             f"`{prefix}blacklist` — Manage user blacklists (Owner only)\n"
             f"`{prefix}setlog #channel` — Set logging destination\n"
             f"`{prefix}disablelog` — Disable logging\n"
-            f"`{prefix}devtest` — Lock Kinetix into a temporary test channel\n"
+            f"`{prefix}devtest` — Lock Penny into a temporary test channel\n"
             f"`{prefix}undevtest` — Delete test room and unlock bot activity"
         ),
         inline=False
@@ -2377,7 +2384,7 @@ async def blacklist_list(ctx):
 @owner_only()
 async def restart(ctx):
     embed = discord.Embed(
-        title="🔄 Restarting Kinetix",
+        title="🔄 Restarting Penny",
         description="Saving persistent data and cleanly rebooting process...",
         color=discord.Color.orange()
     )
@@ -2819,7 +2826,7 @@ async def devtest(ctx):
         existing_channel = guild.get_channel(existing_id)
         if existing_channel:
             await ctx.send(
-                f"Kinetix is already locked to devtest in {existing_channel.mention}!\n"
+                f"Penny is already locked to devtest in {existing_channel.mention}!\n"
                 f"Run `;undevtest` in that channel to unlock."
             )
             return
@@ -2830,9 +2837,9 @@ async def devtest(ctx):
     }
 
     test_channel = await guild.create_text_channel(
-        name="kinetix-devtest",
+        name="pennyutils-devtest",
         overwrites=overwrites,
-        topic="Temporary testing room for Kinetix. Use ;undevtest to delete.",
+        topic="Temporary testing room for Penny. Use ;undevtest to delete.",
         reason="Devtest isolation initiated"
     )
 
@@ -2840,7 +2847,7 @@ async def devtest(ctx):
     save_data()
 
     await test_channel.send(
-        f"🛠️ **Kinetix Devtest Activated**\n"
+        f"🛠️ **Penny Devtest Activated**\n"
         f"The bot is now completely locked to this channel to prevent chat flood.\n"
         f"When testing is complete, run `{get_prefix(bot, ctx.message)}undevtest` here to delete this channel."
     )
@@ -3265,7 +3272,7 @@ async def on_command_error(ctx, error):
         if "DEVTEST_LOCKED:" in err_msg:
             ch_id = err_msg.split("DEVTEST_LOCKED:")[1].strip()
             await ctx.send(
-                f"🔒 **Command Blocked:** Kinetix is currently locked to <#{ch_id}> in devtest mode.\n"
+                f"🔒 **Command Blocked:** Penny is currently locked to <#{ch_id}> in devtest mode.\n"
                 f"Please run commands inside that channel, or use `{get_prefix(bot, ctx.message)}undevtest` to unlock."
             )
             return
