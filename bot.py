@@ -2891,6 +2891,16 @@ async def favorite(ctx, *, query: str = None):
         await ctx.send(f"No song is currently playing! Provide a link or search query: `;favorite <query>` {EMOJI_BOYKISSER_HUH}")
         return
 
+    target_url = target_track.get("webpage_url") or ""
+    target_host = urllib.parse.urlparse(target_url).hostname
+    if target_track.get("is_attachment") or target_host in {
+        "cdn.discordapp.com",
+        "cdn.discordapp.net",
+        "media.discordapp.net",
+    }:
+        await ctx.send("Uploaded Discord audio files cannot be added to favorites.")
+        return
+
     guild_id_str = str(ctx.guild.id)
     user_id_str = str(ctx.author.id)
 
