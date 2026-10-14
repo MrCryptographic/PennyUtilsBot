@@ -1,3 +1,6 @@
+from discord import app_commands
+import io
+import aiohttp
 import discord
 from discord.ext import commands
 from datetime import timedelta, datetime
@@ -463,10 +466,173 @@ bot = commands.Bot(
     intents=intents,
     help_command=None
 )
+async def setup_hook():
+    # Syncs the context menu commands to Discord globally
+    await bot.tree.sync()
+
+bot.setup_hook = setup_hook
 
 last_reply_time = {}
 user_spam_tracker = {}
 
+# ============================================================
+# CONTEXT MENU / USER APP COMMANDS
+# ============================================================
+
+@bot.tree.context_menu(name="Quote to Image")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def quote_context(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer()
+
+    if not message.content:
+        await interaction.followup.send("This message has no text to quote!", ephemeral=True)
+        return
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import textwrap
+        import aiohttp
+        import io
+
+        # 1. Setup Canvas
+        bg_color = (49, 51, 56) # Discord Dark Mode background
+        canvas = Image.new("RGB", (800, 250), bg_color)
+        draw = ImageDraw.Draw(canvas)
+
+        # 2. Get Fonts (using standard system sans-serif fonts)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        win_fonts_dir = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+        font_candidates = ["segoeui.ttf", "arial.ttf", "calibri.ttf"]
+        
+        chosen_font_path = None
+        for f_name in font_candidates:
+            if os.path.exists(os.path.join(win_fonts_dir, f_name)):
+                chosen_font_path = os.path.join(win_fonts_dir, f_name)
+                break
+                
+        if chosen_font_path:
+            name_font = ImageFont.truetype(chosen_font_path, 32)
+            text_font = ImageFont.truetype(chosen_font_path, 28)
+            date_font = ImageFont.truetype(chosen_font_path, 20)
+        else:
+            name_font = text_font = date_font = ImageFont.load_default()
+
+        # 3. Download and draw Avatar
+        avatar_data = await message.author.display_avatar.with_size(128).read()
+        avatar_img = Image.open(io.BytesIO(avatar_data)).convert("RGBA")
+        avatar_img = avatar_img.resize((80, 80))
+        
+        # Circular Mask
+        mask = Image.new("L", (80, 80), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.ellipse((0, 0, 80, 80), fill=255)
+        avatar_img.putalpha(mask)
+        
+        canvas.paste(avatar_img, (30, 30), avatar_img)
+
+        # 4. Draw Name & Date
+        # Convert hex color to RGB tuple
+        color_hex = str(message.author.color).lstrip('#')
+        if color_hex == "000000": 
+            color_hex = "ffffff" # Default to white if no custom role color
+        r_col, g_col, b_col = tuple(int(color_hex[i:i+2], 16) for i in (0, 2, 4))
+        
+        draw.text((130, 30), message.author.display_name, fill=(r_col, g_col, b_col), font=name_font)
+        
+        date_str = message.created_at.strftime("%m/%d/%Y %I:%M %p")
+        # Offset date text based on name length
+        name_length = draw.textlength(message.author.display_name, font=name_font)
+        draw.text((130 + name_length + 15, 40), date_str, fill=(148, 155, 164), font=date_font)
+
+        # 5. Wrap and Draw Message Content
+        lines = textwrap.wrap(message.clean_content, width=50)
+        y_offset = 80
+        for line in lines:
+            draw.text((130, y_offset), line, fill=(219, 222, 225), font=text_font)
+            y_offset += 35
+
+        # Resize canvas to fit exactly to the text height + padding
+        final_height = max(150, y_offset + 30)
+        canvas = canvas.crop((0, 0, 800, final_height))
+
+        # 6. Save and Send
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        buffer.seek(0)
+        
+        await interaction.followup.send(file=discord.File(buffer, filename="quote.png"))
+
+    except Exception as e:
+        await interaction.followup.send(f"An error occurred making the quote: {e}", ephemeral=True)
+
+
+@bot.tree.context_menu(name="Convert to GIF")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def convert_to_gif_context(interaction: discord.Interaction, message: discord.Message):
+    # Search for a valid video attachment
+    video_attachment = None
+    for attachment in message.attachments:
+        if attachment.filename.lower().endswith(('.mp4', '.mov', '.webm', '.mkv')):
+            video_attachment = attachment
+            break
+
+    if not video_attachment:
+        await interaction.response.send_message("No valid video attachment (.mp4, .webm, .mov) found in this message!", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_path = os.path.join(script_dir, "temp_video_input.mp4")
+    output_path = os.path.join(script_dir, "converted_output.gif")
+
+    try:
+        # Download the video
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video_attachment.url) as resp:
+                if resp.status == 200:
+                    with open(input_path, 'wb') as f:
+                        f.write(await resp.read())
+                else:
+                    await interaction.followup.send("Failed to download the video attachment.", ephemeral=True)
+                    return
+
+        # Use FFmpeg to convert the video to a GIF
+        # -vf fps=30,scale=480:-1 ensures decent framerate and downscales width to 480px to keep file size under Discord's limits
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-i', input_path, 
+            '-vf', 'fps=30,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse', 
+            '-loop', '0', output_path
+        ]
+        
+        # Run FFmpeg process blocking but in the background
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            await interaction.followup.send("FFmpeg failed to convert the video to a GIF.", ephemeral=True)
+            return
+
+        # Check size (Discord limit is ~25MB for free users)
+        if os.path.getsize(output_path) > 25 * 1024 * 1024:
+            await interaction.followup.send("The resulting GIF is too large to send on Discord (>25MB).", ephemeral=True)
+        else:
+            await interaction.followup.send(file=discord.File(output_path, filename="converted.gif"))
+
+    except Exception as e:
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+    finally:
+        # Cleanup temp files
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
 # ============================================================
 # PERMISSION CHECKS & GLOBAL LOCKS

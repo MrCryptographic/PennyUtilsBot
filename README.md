@@ -6,12 +6,15 @@ generators, a local AI chat integration, and voice-channel music playback.
 ## Features
 
 - Moderation tools with per-command moderation logs.
+- Embed-based moderation, message edit/delete, and purge logs sent to a
+  server-configured channel.
 - Captioned meme GIFs and an interactive two-panel meme.
 - Music search and playback, queue controls, audio filters, favorites, and
-  personal or server playlists.
+  personal or server playlists. Play supported audio files uploaded to Discord
+  with `;playfile`.
 - Optional AI chat served locally by LM Studio.
-- Persistent settings, warnings, playlists, favorites, and moderation data
-  stored in local JSON files.
+- Per-command usage totals and persistent settings, warnings, playlists,
+  favorites, and moderation data stored in local JSON files.
 
 ## Requirements
 
@@ -21,16 +24,39 @@ generators, a local AI chat integration, and voice-channel music playback.
   chat (optional).
 - A Discord bot application and token.
 
-Install the Python dependencies:
+### Install Python dependencies
+
+The project includes a [`requirements.txt`](requirements.txt) manifest. From
+the project root, create and activate a virtual environment, then install all
+listed dependencies:
+
+**Windows PowerShell:**
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+**macOS / Linux:**
 
 ```bash
-pip install discord.py python-dotenv yt-dlp PyNaCl Pillow aiohttp
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+The manifest installs `discord.py`, `python-dotenv`, `yt-dlp`, `PyNaCl`,
+`Pillow`, and `aiohttp`. FFmpeg and LM Studio are separate system applications;
+install FFmpeg separately and add it to `PATH`. LM Studio is only needed for
+the optional AI chat.
 
 ## Setup
 
-1. Install the requirements above and make sure `ffmpeg` is available from your
-   terminal.
+1. Follow the dependency installation steps above and make sure `ffmpeg` is
+   available from your terminal.
 2. Create a `.env` file in the project root:
 
    ```env
@@ -158,11 +184,13 @@ select that persona or clear your chat.
 
 Music commands are for a server voice channel. The user invoking playback must
 be in a voice channel; Penny also needs the required voice-channel permissions.
+Looping a track replays it without posting a duplicate “Now Playing” message
+for each repeat.
 
 | Command | Aliases | Description |
 | --- | --- | --- |
 | `;play <search query or URL>` | `;p` | Play a search result or URL; playlist URLs are queued. |
-| `;playfile` | — | Play one supported audio file attached to the command, or reply to a message containing that file and run `;playfile`; supported extensions: `.aac`, `.flac`, `.m4a`, `.mp3`, `.oga`, `.ogg`, `.opus`, `.wav`, `.webm`, and `.wma`. |
+| `;playfile` | — | Play one supported audio file attached to the command, or reply to a message containing that file and run `;playfile`; supported extensions: `.aac`, `.flac`, `.m4a`, `.mp3`, `.oga`, `.ogg`, `.opus`, `.wav`, `.webm`, and `.wma`. Uploaded files can’t be saved as favorites. |
 | `;join` | — | Join or move to your voice channel. |
 | `;leave` | `;disconnect` | Disconnect and clear the current queue. |
 | `;skip` | `;s`, `;next` | Skip the current track. |
@@ -176,7 +204,7 @@ be in a voice channel; Penny also needs the required voice-channel permissions.
 | `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `superbassboost`, `very_loud`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
 | `;autorestart` | `;autorestartfx`, `;autorestarteffect` | Toggle restarting the current track when an effect changes. |
 | `;autoplay` | `;ap`, `;auto` | Toggle automatic related-track playback when the queue ends. |
-| `;favorite [search query or URL]` | `;fav` | Save the current track, or look up and save a supplied track. Favorites are saved to both this server and your personal list. |
+| `;favorite [search query or URL]` | `;fav` | Save the current track, or look up and save a supplied track. Favorites are saved to both this server and your personal list. Uploaded Discord audio files cannot be favorited. |
 | `;favorites` | `;favs` | Open the interactive server/personal favorites manager. |
 
 ### Playlists
@@ -221,7 +249,12 @@ Bot settings, moderation warnings, and devtest state are stored in
 `bot_data.json`; favorites and playlists are stored in `favorites.json` and
 `playlists.json`. Recognized command invocations are counted by canonical
 command name (without arguments, with aliases grouped together) in
-`command_usage.json`. AI prompts are sent to the locally configured LM Studio
-endpoint, not to a hosted AI API by this code. Discord command interactions
-still pass through Discord, and AI chat history is kept in bot memory only
-while the bot process is running.
+`command_usage.json`; the counts are aggregate totals and are not attributed to
+individual users. Configured moderation logs include actions, edits, deletions,
+and purge transcripts, and may contain cached message content and attachment
+filenames. Discord audit-log access is required for the bot to identify the
+moderator who deleted a message; otherwise the actor is recorded as unknown.
+AI prompts are sent to the locally configured LM Studio endpoint, not to a
+hosted AI API by this code. Discord command interactions still pass through
+Discord, and AI chat history is kept in bot memory only while the bot process
+is running.
