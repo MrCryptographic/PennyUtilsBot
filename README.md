@@ -9,9 +9,11 @@ generators, a local AI chat integration, and voice-channel music playback.
 - Embed-based moderation, message edit/delete, and purge logs sent to a
   server-configured channel.
 - Captioned meme GIFs and an interactive two-panel meme.
-- Music search and playback, queue controls, audio filters, favorites, and
-  personal or server playlists. Play supported audio files uploaded to Discord
-  with `;playfile`.
+- Music search and playback, queue controls, configurable crossfade, audio
+  filters, favorites, and personal or server playlists. Play supported audio
+  files uploaded to Discord with `;playfile` or `/playfile`.
+- Slash commands for most general, AI, meme, utility, and music features, with
+  prefix commands retained for compatibility.
 - Optional AI chat served locally by LM Studio.
 - Per-command usage totals and persistent settings, warnings, playlists,
   favorites, and moderation data stored in local JSON files.
@@ -64,9 +66,12 @@ the optional AI chat.
    ```
 
    Keep this file private; do not commit your token.
-3. In the Discord Developer Portal, enable the **Message Content Intent** (the
-   bot uses prefix commands). The bot requests all Discord intents, so enable
-   any privileged intents required by your application.
+3. In the Discord Developer Portal, enable the **Message Content Intent** (for
+   prefix commands). Under **Installation**, enable both **Guild Install** and
+   **User Install** and include the `bot` and `applications.commands` scopes for
+   guild installs and `applications.commands` for user installs. The bot
+   requests all Discord intents, so enable any privileged intents required by
+   your application.
 4. Keep the following meme templates in the `assets` folder:
    `basketball.gif`, `boykisser-leash.gif`, `fanumfood.gif`, `jarvis.gif`,
    `lockin.png`, `lowtiergod.gif`, `reason.gif`, `spongebob.gif`,
@@ -80,9 +85,17 @@ the optional AI chat.
 
 The default command prefix is `;`. The owner can change it per server with
 `;prefix <new-prefix>`. Replace `;` in the examples below with the configured
-prefix. Moderation and owner-only access are restricted to user IDs configured
-in `bot.py`; being a Discord server moderator alone does not grant those
-commands unless that ID is configured.
+prefix. Slash versions of most general, AI, meme, utility, and music commands
+are also registered globally; global command updates can take time to appear.
+User-installed general commands can also be used in DMs. The commands are
+available in server channels whether Penny was installed to the server or by a
+user. User installation does not add Penny to a server, however: music playback
+requires Penny to be installed in that server with voice permissions.
+Moderation, owner-only, and reply-to-message commands remain prefix-only.
+Some server-specific slash commands, such as `/serverinfo`, are only available
+when Penny is installed to the server. Moderation and owner-only access are
+restricted to user IDs configured in `bot.py`; being a Discord server moderator
+alone does not grant those commands unless that ID is configured.
 
 ## Commands
 
@@ -118,6 +131,10 @@ the actor as unknown. Message contents may be included in these logs.
 | `;devtest` / `;undevtest` | Create a temporary channel and restrict bot activity to it, then end the test and delete the channel. |
 
 ### Server and user utilities
+
+The public utility, fun, meme, AI, and music commands below are also available
+as slash commands using their primary command names (for example, `/ping`,
+`/chat`, `/jarvis`, and `/play`). Prefix examples remain supported.
 
 | Command | Description |
 | --- | --- |
@@ -167,7 +184,8 @@ using the matching image in `assets` (or the project root as a fallback).
 
 The AI uses the locally hosted LM Studio server at
 `http://localhost:1234/v1/chat/completions`. It is optional and must be running
-for chat commands to work.
+for chat commands to work. `persona`, `clearchat`, and `chat` are available as
+slash commands as well as prefix commands.
 
 | Command | Description |
 | --- | --- |
@@ -185,7 +203,11 @@ select that persona or clear your chat.
 Music commands are for a server voice channel. The user invoking playback must
 be in a voice channel; Penny also needs the required voice-channel permissions.
 Looping a track replays it without posting a duplicate “Now Playing” message
-for each repeat.
+for each repeat. Crossfade is enabled at five seconds by default for consecutive
+tracks with known durations. It is skipped for unknown-duration sources (such
+as uploaded audio) and while looping; use `/crossfade` or `;crossfade` to set a
+duration from 0 to 10 seconds, where 0 disables crossfade. Slash commands still
+require Penny to be connected to the server voice channel for playback.
 
 | Command | Aliases | Description |
 | --- | --- | --- |
@@ -201,6 +223,7 @@ for each repeat.
 | `;nowplaying` | `;np` | Show the current track and interactive player controls. |
 | `;volume [1-100]` | `;vol` | Show or set playback volume. |
 | `;loop` | — | Toggle looping of the current track. |
+| `;crossfade [seconds]` | — | Show or set crossfade duration (0–10 seconds; default 5, 0 disables). |
 | `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `superbassboost`, `very_loud`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
 | `;autorestart` | `;autorestartfx`, `;autorestarteffect` | Toggle restarting the current track when an effect changes. |
 | `;autoplay` | `;ap`, `;auto` | Toggle automatic related-track playback when the queue ends. |
@@ -211,7 +234,9 @@ for each repeat.
 
 Use `;playlist` (aliases: `;pl`, `;playlists`) to show playlist syntax. Playlists
 are personal by default. Add `--server` to use a server-wide playlist; only
-configured moderators can create or change server playlists.
+configured moderators can create or change server playlists. The slash-command
+group is `/playlist` with the same subcommands; use its `flag` option for
+`--server`.
 
 | Command | Description |
 | --- | --- |
@@ -247,8 +272,8 @@ report that the feature is unavailable.
 
 Bot settings, moderation warnings, and devtest state are stored in
 `bot_data.json`; favorites and playlists are stored in `favorites.json` and
-`playlists.json`. Recognized command invocations are counted by canonical
-command name (without arguments, with aliases grouped together) in
+`playlists.json`. Recognized prefix and slash command invocations are counted
+by canonical command name (without arguments, with aliases grouped together) in
 `command_usage.json`; the counts are aggregate totals and are not attributed to
 individual users. Configured moderation logs include actions, edits, deletions,
 and purge transcripts, and may contain cached message content and attachment

@@ -1,4 +1,5 @@
 from discord import app_commands
+from array import array
 import io
 import aiohttp
 import discord
@@ -198,8 +199,9 @@ def save_command_usage():
 
 
 def get_prefix(bot, message):
+    guild = getattr(message, "guild", None)
     return data["prefixes"].get(
-        str(message.guild.id) if message.guild else "dm",
+        str(guild.id) if guild else "dm",
         DEFAULT_PREFIX
     )
 
@@ -466,8 +468,63 @@ bot = commands.Bot(
     intents=intents,
     help_command=None
 )
+
+def hybrid_command(*args, **kwargs):
+    def decorator(callback):
+        callback = app_commands.allowed_installs(guilds=True, users=True)(callback)
+        callback = app_commands.allowed_contexts(
+            guilds=True,
+            dms=True,
+            private_channels=True
+        )(callback)
+        return bot.hybrid_command(*args, **kwargs)(callback)
+    return decorator
+
+
+def hybrid_group(*args, **kwargs):
+    def decorator(callback):
+        callback = app_commands.allowed_installs(guilds=True, users=True)(callback)
+        callback = app_commands.allowed_contexts(
+            guilds=True,
+            dms=True,
+            private_channels=True
+        )(callback)
+        return bot.hybrid_group(*args, **kwargs)(callback)
+    return decorator
+
+
+def guild_hybrid_command(*args, **kwargs):
+    def decorator(callback):
+        callback = app_commands.allowed_installs(guilds=True, users=False)(callback)
+        callback = app_commands.allowed_contexts(guilds=True)(callback)
+        return bot.hybrid_command(*args, **kwargs)(callback)
+    return decorator
+
+
+class MusicServerInstallRequired(commands.CheckFailure):
+    pass
+
+
+def has_installed_guild(ctx):
+    return ctx.guild is not None and bot.get_guild(ctx.guild.id) is not None
+
+
+async def music_server_installed(ctx):
+    if not has_installed_guild(ctx):
+        raise MusicServerInstallRequired()
+    return True
+
+
+def music_command(*args, **kwargs):
+    def decorator(callback):
+        callback = commands.check(music_server_installed)(callback)
+        callback = app_commands.allowed_installs(guilds=True, users=True)(callback)
+        callback = app_commands.allowed_contexts(guilds=True)(callback)
+        return bot.hybrid_command(*args, **kwargs)(callback)
+    return decorator
+
+
 async def setup_hook():
-    # Syncs the context menu commands to Discord globally
     await bot.tree.sync()
 
 bot.setup_hook = setup_hook
@@ -571,52 +628,81 @@ async def quote_context(interaction: discord.Interaction, message: discord.Messa
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def convert_to_gif_context(interaction: discord.Interaction, message: discord.Message):
-    # Search for a valid video attachment
-    video_attachment = None
+    # Search for a valid video or image attachment
+    target_attachment = None
+    is_video = False
+
+    video_exts = ('.mp4', '.mov', '.webm', '.mkv')
+    image_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
     for attachment in message.attachments:
-        if attachment.filename.lower().endswith(('.mp4', '.mov', '.webm', '.mkv')):
-            video_attachment = attachment
+        lower_name = attachment.filename.lower()
+        if lower_name.endswith(video_exts):
+            target_attachment = attachment
+            is_video = True
+            break
+        elif lower_name.endswith(image_exts):
+            target_attachment = attachment
+            is_video = False
             break
 
-    if not video_attachment:
-        await interaction.response.send_message("No valid video attachment (.mp4, .webm, .mov) found in this message!", ephemeral=True)
+    if not target_attachment:
+        await interaction.response.send_message("No valid video or image attachment found in this message!", ephemeral=True)
         return
 
     await interaction.response.defer()
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    input_path = os.path.join(script_dir, "temp_video_input.mp4")
+    ext = os.path.splitext(target_attachment.filename)[1].lower()
+    input_path = os.path.join(script_dir, f"temp_input{ext}")
     output_path = os.path.join(script_dir, "converted_output.gif")
 
     try:
-        # Download the video
+        # Download the attachment
         async with aiohttp.ClientSession() as session:
-            async with session.get(video_attachment.url) as resp:
+            async with session.get(target_attachment.url) as resp:
                 if resp.status == 200:
                     with open(input_path, 'wb') as f:
                         f.write(await resp.read())
                 else:
-                    await interaction.followup.send("Failed to download the video attachment.", ephemeral=True)
+                    await interaction.followup.send("Failed to download the attachment.", ephemeral=True)
                     return
 
-        # Use FFmpeg to convert the video to a GIF
-        # -vf fps=30,scale=480:-1 ensures decent framerate and downscales width to 480px to keep file size under Discord's limits
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', input_path, 
-            '-vf', 'fps=30,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse', 
-            '-loop', '0', output_path
-        ]
-        
-        # Run FFmpeg process blocking but in the background
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        # Process based on file type
+        if is_video:
+            # Use FFmpeg to convert the video to a GIF
+            ffmpeg_cmd = [
+                'ffmpeg', '-y', '-i', input_path, 
+                '-vf', 'fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse', 
+                '-loop', '0', output_path
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+        else:
+            # Use Pillow to convert the image to a GIF
+            from PIL import Image
+            with Image.open(input_path) as img:
+                # Check if it's an animated image (like animated WebP)
+                if getattr(img, "is_animated", False):
+                    img.save(output_path, format="GIF", save_all=True)
+                else:
+                    # Convert static images to RGB to prevent transparency/alpha channel crashes in GIF format
+                    if img.mode in ("RGBA", "P", "LA"):
+                        # Create a white background to paste transparent pixels on
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        if img.mode == "RGBA":
+                            bg.paste(img, mask=img.split()[3])
+                        else:
+                            bg.paste(img.convert("RGBA"))
+                        img = bg
+                    img.save(output_path, format="GIF")
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            await interaction.followup.send("FFmpeg failed to convert the video to a GIF.", ephemeral=True)
+            await interaction.followup.send("Failed to convert the file to a GIF.", ephemeral=True)
             return
 
         # Check size (Discord limit is ~25MB for free users)
@@ -844,7 +930,7 @@ def format_deleted_message(message):
 
 user_chat_history = {}
 
-@bot.command()
+@hybrid_command()
 async def persona(ctx, name: str = None):
     if not name:
         available = ", ".join([f"`{p}`" for p in ai_chat.PERSONALITIES.keys()])
@@ -864,12 +950,12 @@ async def persona(ctx, name: str = None):
     user_chat_history.pop(ctx.author.id, None)
     await ctx.send(f"Your AI persona has been updated to **{name}**. Conversation history cleared! {EMOJI_BLUSH}")
 
-@bot.command()
+@hybrid_command()
 async def clearchat(ctx):
     user_chat_history.pop(ctx.author.id, None)
     await ctx.send(f"Your chat history has been wiped! Amnesia time! {EMOJI_SHOCKED}")
 
-@bot.command(aliases=["c", "ai"])
+@hybrid_command(aliases=["c", "ai"])
 async def chat(ctx, *, message: str = None):
     if not message:
         await ctx.send(f"What do you want to say to me? {EMOJI_BOYKISSER_HUH}")
@@ -955,6 +1041,7 @@ def get_music_state(guild_id: int):
             "effect": "none",
             "volume": 0.5,
             "loop": False,
+            "crossfade": 5,
             "autoplay": False,
             "autorestart_on_effect": True,
             "disconnect_task": None,
@@ -1018,7 +1105,7 @@ async def resolve_stream(track_dict: dict):
     target_url = track_dict.get('webpage_url') or track_dict.get('url')
     
     if target_url and (track_dict.get("is_attachment") or "videoplayback" in target_url):
-        return target_url
+        return target_url, track_dict.get("duration")
 
     loop = asyncio.get_event_loop()
     def _extract():
@@ -1029,21 +1116,224 @@ async def resolve_stream(track_dict: dict):
         data_info = await loop.run_in_executor(None, _extract)
     except Exception as e:
         print(f"[Extractor Error]: {e}")
-        return None
+        return None, None
 
     if not data_info:
-        return None
+        return None, None
 
     if data_info.get('url'):
-        return data_info['url']
+        return data_info['url'], data_info.get("duration")
 
     if 'formats' in data_info:
         audio_formats = [f for f in data_info['formats'] if f.get('acodec') != 'none' and f.get('url')]
         if audio_formats:
             audio_only = [f for f in audio_formats if f.get('vcodec') == 'none']
-            return audio_only[-1]['url'] if audio_only else audio_formats[-1]['url']
+            stream_url = audio_only[-1]['url'] if audio_only else audio_formats[-1]['url']
+            return stream_url, data_info.get("duration")
 
-    return None
+    return None, None
+
+
+def effective_audio_duration(duration, effect_name):
+    if not duration:
+        return duration
+    if effect_name == "nightcore":
+        return duration / 1.25
+    if effect_name == "vaporwave":
+        return duration / 0.8
+    return duration
+
+
+class CrossfadeAudioSource(discord.AudioSource):
+    def __init__(self, source, duration, fade_seconds, effect, on_transition, can_crossfade):
+        self.source = source
+        self.duration = duration
+        self.fade_seconds = fade_seconds
+        self.effect = effect
+        self.on_transition = on_transition
+        self.can_crossfade = can_crossfade
+        self.played_frames = 0
+        self.next_track = None
+        self.next_stream_url = None
+        self.next_duration = None
+        self.next_source = None
+        self._transition_started = False
+
+    def set_next(self, track, stream_url, duration):
+        self.next_stream_url = stream_url
+        self.next_duration = duration
+        self.next_track = track
+
+    def _start_transition(self):
+        if (
+            not self.next_track
+            or not self.next_stream_url
+            or not self.next_duration
+        ):
+            return False
+        try:
+            self.next_source = discord.FFmpegPCMAudio(
+                self.next_stream_url,
+                **get_ffmpeg_options(self.effect)
+            )
+        except (OSError, discord.ClientException) as error:
+            print(f"Could not start crossfade source: {error}")
+            self.next_track = None
+            self.next_stream_url = None
+            self.next_duration = None
+            return False
+        self._transition_started = True
+        self.on_transition(self.next_track)
+        return True
+
+    def read(self):
+        data = self.source.read()
+        if not data:
+            if self.next_source is None and not self._transition_started and self.can_crossfade():
+                self._start_transition()
+            if self.next_source is None:
+                return b""
+            self.source.cleanup()
+            self.source = self.next_source
+            self.duration = self.next_duration
+            self.played_frames = 0
+            self.next_source = None
+            self.next_track = None
+            self.next_stream_url = None
+            self.next_duration = None
+            self._transition_started = False
+            return self.source.read()
+
+        frame_count = len(data) // 4
+        frames_before = self.played_frames
+        self.played_frames += frame_count
+
+        if (
+            self.duration is None
+            or self.fade_seconds <= 0
+            or not self.can_crossfade()
+            or not self.next_track
+            or not self.next_stream_url
+            or not self.next_duration
+        ):
+            return data
+
+        duration_frames = int(self.duration * 48000)
+        next_duration_frames = int(self.next_duration * 48000)
+        fade_frames = min(
+            int(self.fade_seconds * 48000),
+            duration_frames,
+            next_duration_frames
+        )
+        fade_start = max(0, duration_frames - fade_frames)
+        if self.played_frames <= fade_start:
+            return data
+
+        if self.next_source is None and not self._start_transition():
+            return data
+
+        next_data = self.next_source.read()
+        if not next_data:
+            next_data = b"\x00" * len(data)
+        if len(next_data) < len(data):
+            next_data += b"\x00" * (len(data) - len(next_data))
+
+        current_samples = array("h")
+        next_samples = array("h")
+        current_samples.frombytes(data[:len(data) // 4 * 4])
+        next_samples.frombytes(next_data[:len(data) // 4 * 4])
+        first_fade_frame = max(0, frames_before - fade_start)
+
+        for frame in range(frame_count):
+            progress = min(1.0, (first_fade_frame + frame) / max(1, fade_frames))
+            current_gain = 1.0 - progress
+            next_gain = progress
+            sample_index = frame * 2
+            current_samples[sample_index] = int(current_samples[sample_index] * current_gain)
+            current_samples[sample_index + 1] = int(current_samples[sample_index + 1] * current_gain)
+            next_samples[sample_index] = int(next_samples[sample_index] * next_gain)
+            next_samples[sample_index + 1] = int(next_samples[sample_index + 1] * next_gain)
+
+        mixed = array("h", (
+            max(-32768, min(32767, current_samples[index] + next_samples[index]))
+            for index in range(len(current_samples))
+        )).tobytes()
+
+        if self.played_frames >= duration_frames:
+            self.source.cleanup()
+            self.source = self.next_source
+            self.duration = self.next_duration
+            self.played_frames = fade_frames
+            self.next_source = None
+            self.next_track = None
+            self.next_stream_url = None
+            self.next_duration = None
+            self._transition_started = False
+
+        return mixed
+
+    def is_opus(self):
+        return False
+
+    def cleanup(self):
+        self.source.cleanup()
+        if self.next_source:
+            self.next_source.cleanup()
+
+
+async def prepare_crossfade_next(guild_id: int):
+    state = get_music_state(guild_id)
+    guild = bot.get_guild(guild_id)
+    voice_client = guild.voice_client if guild else None
+    active_source = getattr(
+        getattr(voice_client, "source", None),
+        "original",
+        None
+    )
+    if not isinstance(active_source, CrossfadeAudioSource):
+        return
+    if (
+        state["loop"]
+        or state["crossfade"] <= 0
+        or not state["queue"]
+    ):
+        return
+    if active_source.next_track is not None:
+        if active_source.next_source is not None:
+            return
+        if state["queue"][0] is active_source.next_track:
+            return
+        active_source.next_track = None
+        active_source.next_stream_url = None
+        active_source.next_duration = None
+
+    next_track = state["queue"][0]
+    stream_url, duration = await resolve_stream(next_track)
+    if (
+        stream_url
+        and state["queue"]
+        and state["queue"][0] is next_track
+        and active_source.next_track is None
+        and not state["loop"]
+    ):
+        if duration is not None:
+            next_track["duration"] = duration
+        active_source.set_next(
+            next_track,
+            stream_url,
+            effective_audio_duration(duration, state["effect"])
+        )
+
+
+def request_crossfade_prefetch(guild_id: int):
+    state = get_music_state(guild_id)
+    task = state.get("crossfade_prefetch_task")
+    if task and not task.done():
+        return
+    state["crossfade_prefetch_task"] = asyncio.create_task(
+        prepare_crossfade_next(guild_id)
+    )
+
 
 async def play_next_track(guild_id: int):
     state = get_music_state(guild_id)
@@ -1118,16 +1408,94 @@ async def play_next_track(guild_id: int):
     cancel_disconnect(guild_id)
 
     try:
-        stream_url = await resolve_stream(track)
+        stream_url, duration = await resolve_stream(track)
         if not stream_url:
             if state["text_channel"]:
                 await state["text_channel"].send(f"Could not load audio for **{track['title']}**. Skipping... {EMOJI_SHOCKED}")
             await play_next_track(guild_id)
             return
 
+        if duration is not None:
+            track["duration"] = duration
+
         ffmpeg_opts = get_ffmpeg_options(state["effect"])
         source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
-        transformed = discord.PCMVolumeTransformer(source, volume=state["volume"])
+        playback_duration = effective_audio_duration(duration, state["effect"])
+        if not is_loop_replay and state["crossfade"] > 0 and playback_duration:
+            async def on_transition(next_track):
+                state["queue"][:] = [queued for queued in state["queue"] if queued is not next_track]
+                state["current"] = next_track
+                state["history"].append(next_track)
+                if len(state["history"]) > 50:
+                    state["history"].pop(0)
+
+                if vc.channel:
+                    await update_vc_status(
+                        vc.channel,
+                        f"🎶 {sanitize_markdown(next_track['title'], max_len=60)}"
+                    )
+                if state["text_channel"]:
+                    next_title = sanitize_markdown(next_track["title"], max_len=60)
+                    fx_note = f" (Effect: `{state['effect']}`)" if state["effect"] != "none" else ""
+                    embed = discord.Embed(
+                        title="🎶 Now Playing",
+                        description=f"[{next_title}]({next_track['webpage_url']}){fx_note}",
+                        color=discord.Color.purple()
+                    )
+                    await state["text_channel"].send(
+                        embed=embed,
+                        view=NowPlayingView(guild_id)
+                    )
+
+                if state["queue"] and state["crossfade"] > 0 and not state["loop"]:
+                    following_track = state["queue"][0]
+                    following_url, following_duration = await resolve_stream(following_track)
+                    if following_url:
+                        if following_duration is not None:
+                            following_track["duration"] = following_duration
+                        audio_source.set_next(
+                            following_track,
+                            following_url,
+                            effective_audio_duration(
+                                following_duration,
+                                state["effect"]
+                            )
+                        )
+
+            def transition_callback(next_track):
+                asyncio.run_coroutine_threadsafe(on_transition(next_track), bot.loop)
+
+            audio_source = CrossfadeAudioSource(
+                source,
+                playback_duration,
+                state["crossfade"],
+                state["effect"],
+                transition_callback,
+                lambda: (
+                    audio_source._transition_started
+                    or (
+                        not state["loop"]
+                        and bool(state["queue"])
+                        and state["queue"][0] is audio_source.next_track
+                        and bool(audio_source.next_duration)
+                    )
+                )
+            )
+            if state["queue"]:
+                next_track = state["queue"][0]
+                next_url, next_duration = await resolve_stream(next_track)
+                if next_url:
+                    if next_duration is not None:
+                        next_track["duration"] = next_duration
+                    audio_source.set_next(
+                        next_track,
+                        next_url,
+                        effective_audio_duration(next_duration, state["effect"])
+                    )
+        else:
+            audio_source = source
+
+        transformed = discord.PCMVolumeTransformer(audio_source, volume=state["volume"])
 
         def after_callback(err):
             if err:
@@ -1579,6 +1947,7 @@ class FavoritesView(discord.ui.View):
                 "webpage_url": item["url"]
             })
 
+        request_crossfade_prefetch(interaction.guild.id)
         if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
             await self.ctx.send(f"Now playing all **{len(fav_list)}** favorite(s)! 🎶 {EMOJI_DANCING}")
@@ -1610,6 +1979,7 @@ class FavoritesView(discord.ui.View):
             "webpage_url": selected_track["url"]
         })
 
+        request_crossfade_prefetch(interaction.guild.id)
         if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
             await self.ctx.send(f"Now playing from favorites: **{selected_track['title']}**! {EMOJI_DANCING}")
@@ -1703,6 +2073,13 @@ class PlaylistView(discord.ui.View):
 
     @discord.ui.button(label="▶️ Play Playlist", style=discord.ButtonStyle.success)
     async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild_id is None or bot.get_guild(interaction.guild_id) is None:
+            await interaction.response.send_message(
+                "Playing playlists requires Penny to be installed in this server.",
+                ephemeral=True
+            )
+            return
+
         tracks = self.get_tracks()
         if not tracks:
             await interaction.response.send_message("This playlist is empty!", ephemeral=True)
@@ -1730,6 +2107,7 @@ class PlaylistView(discord.ui.View):
                 "webpage_url": item["url"]
             })
 
+        request_crossfade_prefetch(interaction.guild.id)
         if not vc.is_playing() and not vc.is_paused():
             await play_next_track(interaction.guild.id)
             await self.ctx.send(f"Now playing playlist **{self.pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_DANCING}")
@@ -1985,7 +2363,7 @@ async def nick(ctx, member: discord.Member, *, nickname=None):
     else:
         await ctx.send(f"Nickname reset for **{member}**.")
 
-@bot.command()
+@guild_hybrid_command()
 @commands.guild_only()
 async def serverinfo(ctx):
     guild = ctx.guild
@@ -1999,7 +2377,7 @@ async def serverinfo(ctx):
         embed.set_thumbnail(url=guild.icon.url)
     await ctx.send(embed=embed)
 
-@bot.command()
+@guild_hybrid_command()
 @commands.guild_only()
 async def userinfo(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -2015,14 +2393,14 @@ async def userinfo(ctx, member: discord.Member = None):
     embed.add_field(name="Top Role", value=member.top_role.mention)
     await ctx.send(embed=embed)
 
-@bot.command()
+@hybrid_command()
 async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
     embed = discord.Embed(title=f"{member}'s Avatar", color=member.color)
     embed.set_image(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
-@bot.command()
+@guild_hybrid_command()
 @commands.guild_only()
 async def banner(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -2038,7 +2416,7 @@ async def banner(ctx, member: discord.Member = None):
     embed.set_image(url=user.banner.url)
     await ctx.send(embed=embed)
 
-@bot.command()
+@hybrid_command()
 async def furry(ctx, member: discord.Member = None):
     member = member or ctx.author
     percentage = random.Random(member.id).randint(0, 100)
@@ -2050,7 +2428,7 @@ async def furry(ctx, member: discord.Member = None):
         message = f"Oh my! {member.mention} is **{percentage}%** furry! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-@bot.command(aliases=["match"])
+@hybrid_command(aliases=["match"])
 async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
     if user2 is None:
         user1, user2 = ctx.author, user1
@@ -2067,7 +2445,7 @@ async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
         message = f"💖 **{percentage}%**!!! {user1.mention} and {user2.mention} are a perfect match! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def femboy(ctx, member: discord.Member = None):
     member = member or ctx.author
     percentage = random.Random(member.id).randint(0, 100)
@@ -2079,7 +2457,7 @@ async def femboy(ctx, member: discord.Member = None):
         message = f"Oh my! {member.mention} is **{percentage}%** femboy! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def kiss(ctx, member: discord.Member = None):
     if not member:
         message = f"Please mention someone to kiss! {EMOJI_BOYKISSER_HUH}"
@@ -2089,7 +2467,7 @@ async def kiss(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} kisses {member.mention}! {EMOJI_KISS_NEW} {EMOJI_LOVE}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def hug(ctx, member: discord.Member = None):
     if not member:
         message = f"Please mention someone to hug! {EMOJI_BOYKISSER_HUH}"
@@ -2099,7 +2477,7 @@ async def hug(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} gives {member.mention} a warm hug! {EMOJI_LOVE} {EMOJI_BLUSH}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def punch(ctx, member: discord.Member = None):
     if not member:
         message = f"Please mention someone to punch! {EMOJI_BOYKISSER_HUH}"
@@ -2109,7 +2487,7 @@ async def punch(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} punches {member.mention}! {EMOJI_SHOCKED} {EMOJI_BOYKISSER_HUH}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def attack(ctx, member: discord.Member = None):
     if not member:
         await ctx.send(f"Please mention someone to attack! {EMOJI_BOYKISSER_HUH}")
@@ -2123,7 +2501,7 @@ async def attack(ctx, member: discord.Member = None):
         f"{ctx.author.mention} throws a slice of hot pizza at {member.mention}! {EMOJI_PIZZA}"
     ]))
 
-@bot.command()
+@hybrid_command()
 async def boop(ctx, member: discord.Member = None):
     if not member:
         message = f"Please mention someone to boop! {EMOJI_BOYKISSER_HUH}"
@@ -2133,7 +2511,7 @@ async def boop(ctx, member: discord.Member = None):
         message = f"{ctx.author.mention} gently boops {member.mention}'s nose! {EMOJI_BOYKISSER_BOOP}"
     await ctx.send(message)
 
-@bot.command()
+@hybrid_command()
 async def dance(ctx, member: discord.Member = None):
     if member:
         message = f"{ctx.author.mention} and {member.mention} start dancing! {EMOJI_DANCING}"
@@ -2214,47 +2592,47 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
         if os.path.exists(output_path):
             os.remove(output_path)
 
-@bot.command()
+@hybrid_command()
 async def jarvis(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "jarvis.gif", "Jarvis", text)
 
-@bot.command()
+@hybrid_command()
 async def lowtiergod(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "lowtiergod.gif", "Low Tier God", text)
 
-@bot.command(aliases=["floating", "ascend", "sponge"])
+@hybrid_command(aliases=["floating", "ascend", "sponge"])
 async def spongebob(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "spongebob.gif", "Spongebob Floating", text)
 
-@bot.command(aliases=["tuff", "hoodiebob", "sadbob"])
+@hybrid_command(aliases=["tuff", "hoodiebob", "sadbob"])
 async def tuffbob(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "tuffbob.gif", "Tuff Spongebob", text)
 
-@bot.command(aliases=["fanum", "food"])
+@hybrid_command(aliases=["fanum", "food"])
 async def fanumfood(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "fanumfood.gif", "Fanum Food", text)
 
-@bot.command(aliases=["pilot", "crossview"])
+@hybrid_command(aliases=["pilot", "crossview"])
 async def stephen(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "stephen.jpg", "Stephen", text)
 
-@bot.command(aliases=["reason", "heartbeats"])
+@hybrid_command(aliases=["reason", "heartbeats"])
 async def katanaman(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "reason.gif", "Katana Man", text)
 
-@bot.command(aliases=["yaoming", "cried"])
+@hybrid_command(aliases=["yaoming", "cried"])
 async def basketball(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "basketball.gif", "Basketball", text)
 
-@bot.command()
+@hybrid_command()
 async def tryhard(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "tryhard.gif", "Tryhard", text)
 
-@bot.command()
+@hybrid_command()
 async def bkleash(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "boykisser-leash.gif", "Boykisser Leash", text)
 
-@bot.command()
+@hybrid_command()
 async def lockin(ctx, *, text: str = None):
     if not text or "|" not in text:
         await ctx.send(
@@ -2400,7 +2778,7 @@ class HelpPaginator(discord.ui.View):
             except Exception:
                 pass
 
-@bot.command(name="help")
+@hybrid_command(name="help")
 async def help_command(ctx):
     prefix = get_prefix(bot, ctx.message)
     pages = []
@@ -2516,6 +2894,7 @@ async def help_command(ctx):
             f"`{prefix}restartsong` — Restart the currently playing track\n"
             f"`{prefix}volume [1-100]` — View or set audio output volume\n"
             f"`{prefix}loop` — Toggle looping current song\n"
+            f"`{prefix}crossfade [0-10]` — Set crossfade duration (default 5 seconds; 0 disables)\n"
             f"`{prefix}skip` / `{prefix}stop` — Control audio stream\n"
             f"`{prefix}join` / `{prefix}leave` — Summon or disconnect bot"
         ),
@@ -2769,7 +3148,7 @@ async def restart(ctx):
 # MUSIC COMMANDS
 # ============================================================
 
-@bot.command(aliases=["p"])
+@music_command(aliases=["p"])
 async def play(ctx, *, query: str = None):
     if not query:
         await ctx.send(f"Please provide a song title or URL! {EMOJI_BOYKISSER_HUH}")
@@ -2822,7 +3201,8 @@ async def play(ctx, *, query: str = None):
 
                 entries.append({
                     'title': clean_title,
-                    'webpage_url': video_url
+                    'webpage_url': video_url,
+                    'duration': entry.get("duration")
                 })
         for t in entries:
             state["queue"].append(t)
@@ -2839,7 +3219,8 @@ async def play(ctx, *, query: str = None):
 
         track_item = {
             'title': clean_title,
-            'webpage_url': video_url
+            'webpage_url': video_url,
+            'duration': target.get("duration")
         }
         state["queue"].append(track_item)
         if voice_client.is_playing() or voice_client.is_paused():
@@ -2849,11 +3230,13 @@ async def play(ctx, *, query: str = None):
 
     if not voice_client.is_playing() and not voice_client.is_paused():
         await play_next_track(ctx.guild.id)
+    else:
+        request_crossfade_prefetch(ctx.guild.id)
 
-@bot.command()
+@music_command()
 @commands.guild_only()
-async def playfile(ctx):
-    attachments = ctx.message.attachments
+async def playfile(ctx, attachment: discord.Attachment = None):
+    attachments = [attachment] if attachment else ctx.message.attachments
     if (
         not attachments
         and ctx.message.reference
@@ -2914,11 +3297,12 @@ async def playfile(ctx):
 
     if voice_client.is_playing() or voice_client.is_paused():
         await ctx.send(f"Added uploaded audio to the queue: **{track['title']}**.")
+        request_crossfade_prefetch(ctx.guild.id)
     else:
         await ctx.send(f"Playing uploaded audio: **{track['title']}**.")
         await play_next_track(ctx.guild.id)
 
-@bot.command(aliases=["s", "next"])
+@music_command(aliases=["s", "next"])
 async def skip(ctx):
     vc = ctx.guild.voice_client
     if not vc or (not vc.is_playing() and not vc.is_paused()):
@@ -2928,7 +3312,7 @@ async def skip(ctx):
     vc.stop()
     await ctx.send(f"Skipped track! {EMOJI_BOYKISSER_RIGHT}")
 
-@bot.command(aliases=["replay"])
+@music_command(aliases=["replay"])
 async def restartsong(ctx):
     state = get_music_state(ctx.guild.id)
     vc = ctx.guild.voice_client
@@ -2942,7 +3326,7 @@ async def restartsong(ctx):
     vc.stop()
     await ctx.send(f"Restarted **{current_track['title']}**! 🔄")
 
-@bot.command()
+@music_command()
 async def pause(ctx):
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
@@ -2951,7 +3335,7 @@ async def pause(ctx):
     else:
         await ctx.send(f"Nothing is currently playing! {EMOJI_BOYKISSER_HUH}")
 
-@bot.command()
+@music_command()
 async def resume(ctx):
     vc = ctx.guild.voice_client
     if vc and vc.is_paused():
@@ -2960,7 +3344,7 @@ async def resume(ctx):
     else:
         await ctx.send(f"Playback is not paused! {EMOJI_BOYKISSER_HUH}")
 
-@bot.command()
+@music_command()
 async def stop(ctx):
     state = get_music_state(ctx.guild.id)
     state["queue"].clear()
@@ -2976,13 +3360,13 @@ async def stop(ctx):
     await ctx.send(f"Stopped music and cleared the queue. {EMOJI_SHOCKED}")
     await schedule_disconnect(ctx.guild.id, delay=180)
 
-@bot.command(aliases=["q"])
+@music_command(aliases=["q"])
 async def queue(ctx):
     view = InteractiveQueueView(ctx.guild.id)
     embed = view.get_embed()
     await ctx.send(embed=embed, view=view)
 
-@bot.command(aliases=["np"])
+@music_command(aliases=["np"])
 async def nowplaying(ctx):
     state = get_music_state(ctx.guild.id)
     if not state["current"]:
@@ -3006,7 +3390,7 @@ async def nowplaying(ctx):
     view = NowPlayingView(ctx.guild.id)
     await ctx.send(embed=embed, view=view)
 
-@bot.command(aliases=["vol"])
+@music_command(aliases=["vol"])
 async def volume(ctx, vol: int = None):
     state = get_music_state(ctx.guild.id)
     if vol is None:
@@ -3025,14 +3409,37 @@ async def volume(ctx, vol: int = None):
 
     await ctx.send(f"Volume adjusted to `{vol}%`. {EMOJI_BLUSH}")
 
-@bot.command()
+@music_command()
 async def loop(ctx):
     state = get_music_state(ctx.guild.id)
     state["loop"] = not state["loop"]
     status = "enabled" if state["loop"] else "disabled"
     await ctx.send(f"Track looping is now **{status}**. {EMOJI_DANCING}")
 
-@bot.command(aliases=["effects", "filter"])
+@music_command()
+async def crossfade(ctx, seconds: int = None):
+    state = get_music_state(ctx.guild.id)
+    if seconds is None:
+        await ctx.send(f"Crossfade is set to `{state['crossfade']}` second(s). Use `/crossfade 0` to disable it.")
+        return
+    if not 0 <= seconds <= 10:
+        await ctx.send("Crossfade duration must be between 0 and 10 seconds.")
+        return
+    state["crossfade"] = seconds
+    voice_client = ctx.guild.voice_client
+    active_source = getattr(
+        getattr(voice_client, "source", None),
+        "original",
+        None
+    )
+    if isinstance(active_source, CrossfadeAudioSource):
+        active_source.fade_seconds = seconds
+    await ctx.send(
+        "Crossfade disabled." if seconds == 0
+        else f"Crossfade set to `{seconds}` second(s)."
+    )
+
+@music_command(aliases=["effects", "filter"])
 async def effect(ctx, effect_name: str = None):
     state = get_music_state(ctx.guild.id)
     if effect_name:
@@ -3064,7 +3471,7 @@ async def effect(ctx, effect_name: str = None):
     view = EffectSelectView(ctx.guild.id)
     await ctx.send(embed=embed, view=view)
 
-@bot.command(aliases=["autorestartfx", "autorestarteffect"])
+@music_command(aliases=["autorestartfx", "autorestarteffect"])
 async def autorestart(ctx):
     state = get_music_state(ctx.guild.id)
     state["autorestart_on_effect"] = not state["autorestart_on_effect"]
@@ -3076,7 +3483,7 @@ async def autorestart(ctx):
 # FAVORITES SYSTEM
 # ============================================================
 
-@bot.command(aliases=["fav"])
+@music_command(aliases=["fav"])
 async def favorite(ctx, *, query: str = None):
     state = get_music_state(ctx.guild.id)
     target_track = None
@@ -3141,7 +3548,7 @@ async def favorite(ctx, *, query: str = None):
     save_favorites()
     await ctx.send(f"Saved **{clean_title}** to favorites! ❤️ {EMOJI_LOVE}")
 
-@bot.command(aliases=["favs"])
+@music_command(aliases=["favs"])
 async def favorites(ctx):
     view = FavoritesView(ctx, mode="guild")
     embed = view.get_embed()
@@ -3152,7 +3559,7 @@ async def favorites(ctx):
 # PLAYLISTS SYSTEM (PERSONAL & SERVER)
 # ============================================================
 
-@bot.group(invoke_without_command=True, aliases=["pl", "playlists"])
+@hybrid_group(invoke_without_command=True, aliases=["pl", "playlists"])
 async def playlist(ctx):
     prefix = get_prefix(bot, ctx.message)
     embed = discord.Embed(
@@ -3173,7 +3580,7 @@ async def playlist(ctx):
     )
     await ctx.send(embed=embed)
 
-@bot.command()
+@music_command()
 async def join(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send(f"You must be in a voice channel first! {EMOJI_BOYKISSER_HUH}")
@@ -3189,7 +3596,7 @@ async def join(ctx):
 
     await ctx.send(f"Connected to **#{channel.name}**! {EMOJI_BOYKISSER_HAPPY}")
 
-@bot.command(aliases=["disconnect"])
+@music_command(aliases=["disconnect"])
 async def leave(ctx):
     voice_client = ctx.guild.voice_client
     if voice_client:
@@ -3329,12 +3736,12 @@ async def undevtest(ctx):
 # UTILITY
 # ============================================================
 
-@bot.command()
+@hybrid_command()
 async def ping(ctx):
     latency = round(bot.latency * 1000)
     await ctx.send(f"Pong! `{latency}ms`")
 
-@bot.command()
+@hybrid_command()
 async def botinfo(ctx):
     embed = discord.Embed(
         title="Bot Information",
@@ -3407,7 +3814,7 @@ async def prefix(ctx, new_prefix=None):
 # ERROR HANDLING
 # ============================================================
 
-@bot.command(aliases=["ap", "auto"])
+@music_command(aliases=["ap", "auto"])
 async def autoplay(ctx):
     state = get_music_state(ctx.guild.id)
     state["autoplay"] = not state.get("autoplay", False)
@@ -3432,6 +3839,9 @@ async def playlist_create(ctx, *, name: str):
         return
 
     if is_server:
+        if not has_installed_guild(ctx):
+            await ctx.send("Server playlists require Penny to be installed in this server.")
+            return
         if not is_moderator(ctx.author.id):
             await ctx.send("Only server moderators can create server-wide playlists!")
             return
@@ -3463,7 +3873,7 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
         pl_name = pl_name.replace("--server", "").strip()
 
     target_track = None
-    state = get_music_state(ctx.guild.id)
+    state = get_music_state(ctx.guild.id) if ctx.guild else None
 
     if query:
         loop = asyncio.get_event_loop()
@@ -3480,7 +3890,7 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
         except Exception as e:
             await ctx.send(f"Failed to lookup track: `{e}`")
             return
-    elif state["current"]:
+    elif state and state["current"]:
         target_track = state["current"]
     else:
         await ctx.send("No track specified or currently playing! Usage: `;playlist add <name> [query] [--server]`")
@@ -3494,6 +3904,9 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
     }
 
     if is_server:
+        if not has_installed_guild(ctx):
+            await ctx.send("Server playlists require Penny to be installed in this server.")
+            return
         if not is_moderator(ctx.author.id):
             await ctx.send("Only server moderators can modify server playlists!")
             return
@@ -3515,6 +3928,7 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
 
 
 @playlist.command(name="play")
+@commands.check(music_server_installed)
 async def playlist_play(ctx, pl_name: str, *, flag: str = ""):
     is_server = "--server" in flag or "--server" in pl_name
     pl_name = pl_name.replace("--server", "").strip()
@@ -3548,6 +3962,7 @@ async def playlist_play(ctx, pl_name: str, *, flag: str = ""):
             "webpage_url": item["url"]
         })
 
+    request_crossfade_prefetch(ctx.guild.id)
     if not vc.is_playing() and not vc.is_paused():
         await play_next_track(ctx.guild.id)
         await ctx.send(f"Now playing playlist **{pl_name}** ({len(tracks)} tracks)! 🎶 {EMOJI_DANCING}")
@@ -3560,6 +3975,9 @@ async def playlist_view(ctx, pl_name: str, *, flag: str = ""):
     is_server = "--server" in flag or "--server" in pl_name
     clean_name = pl_name.replace("--server", "").strip()
 
+    if is_server and not has_installed_guild(ctx):
+        await ctx.send("Server playlists require Penny to be installed in this server.")
+        return
     view = PlaylistView(ctx, clean_name, is_server=is_server)
     embed = view.get_embed()
     await ctx.send(embed=embed, view=view)
@@ -3569,6 +3987,9 @@ async def playlist_view(ctx, pl_name: str, *, flag: str = ""):
 async def playlist_list(ctx, *, flag: str = ""):
     is_server = "--server" in flag
     if is_server:
+        if not has_installed_guild(ctx):
+            await ctx.send("Server playlists require Penny to be installed in this server.")
+            return
         pls = playlists_data["guilds"].get(str(ctx.guild.id), {})
         title = "🌐 Server Playlists"
     else:
@@ -3593,6 +4014,9 @@ async def playlist_remove(ctx, pl_name: str, index: int, *, flag: str = ""):
     pl_name = pl_name.replace("--server", "").strip()
 
     if is_server:
+        if not has_installed_guild(ctx):
+            await ctx.send("Server playlists require Penny to be installed in this server.")
+            return
         if not is_moderator(ctx.author.id):
             await ctx.send("Only server moderators can modify server playlists!")
             return
@@ -3620,6 +4044,9 @@ async def playlist_delete(ctx, pl_name: str, *, flag: str = ""):
     pl_name = pl_name.replace("--server", "").strip()
 
     if is_server:
+        if not has_installed_guild(ctx):
+            await ctx.send("Server playlists require Penny to be installed in this server.")
+            return
         if not is_moderator(ctx.author.id):
             await ctx.send("Only server moderators can delete server playlists!")
             return
@@ -3838,6 +4265,13 @@ async def on_message(message):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, MusicServerInstallRequired):
+        await ctx.send(
+            "Music commands need Penny to be installed in this server; "
+            "a user-only installation cannot connect to voice."
+        )
         return
 
     if isinstance(error, commands.CheckFailure):
