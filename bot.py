@@ -11,6 +11,7 @@ import sys
 import subprocess
 import random
 import asyncio
+import math
 import traceback
 import urllib.parse
 import unicodedata
@@ -34,7 +35,7 @@ TOKEN = os.getenv("TOKEN")
 
 # Default command prefix
 DEFAULT_PREFIX = ";"
-MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+MAX_TIMEOUT_MINUTES = 28 * 24 * 60 - 1
 
 # Users who are allowed to execute moderation commands.
 MODERATOR_IDS = {
@@ -1043,6 +1044,10 @@ def get_music_state(guild_id: int):
             "volume": 0.5,
             "loop": False,
             "crossfade": 5,
+            "playback_generation": 0,
+            "leaving": False,
+            "leave_vote": None,
+            "leave_in_progress": False,
             "autoplay": False,
             "autorestart_on_effect": True,
             "disconnect_task": None,
@@ -1247,8 +1252,8 @@ class CrossfadeAudioSource(discord.AudioSource):
 
         for frame in range(frame_count):
             progress = min(1.0, (first_fade_frame + frame) / max(1, fade_frames))
-            current_gain = 1.0 - progress
-            next_gain = progress
+            current_gain = math.cos(progress * math.pi / 2)
+            next_gain = math.sin(progress * math.pi / 2)
             sample_index = frame * 2
             current_samples[sample_index] = int(current_samples[sample_index] * current_gain)
             current_samples[sample_index + 1] = int(current_samples[sample_index + 1] * current_gain)
@@ -1339,10 +1344,19 @@ def request_crossfade_prefetch(guild_id: int):
 async def play_next_track(guild_id: int):
     state = get_music_state(guild_id)
     guild = bot.get_guild(guild_id)
-    if not guild or not guild.voice_client:
+    if state["leaving"] or not guild or not guild.voice_client:
         return
 
     vc = guild.voice_client
+    generation = state["playback_generation"]
+
+    def playback_is_current():
+        return (
+            music_states.get(guild_id) is state
+            and state["playback_generation"] == generation
+            and not state["leaving"]
+            and guild.voice_client is vc
+        )
 
     is_loop_replay = bool(state["loop"] and state["current"])
     if is_loop_replay:
@@ -1373,6 +1387,8 @@ async def play_next_track(guild_id: int):
                     return ydl.extract_info(mix_url, download=False)
             try:
                 mix_info = await loop_ev.run_in_executor(None, _get_mix)
+                if not playback_is_current():
+                    return
                 if mix_info and 'entries' in mix_info:
                     for entry in mix_info['entries']:
                         if entry and entry.get('id'):
@@ -1410,6 +1426,8 @@ async def play_next_track(guild_id: int):
 
     try:
         stream_url, duration = await resolve_stream(track)
+        if not playback_is_current():
+            return
         if not stream_url:
             if state["text_channel"]:
                 await state["text_channel"].send(f"Could not load audio for **{track['title']}**. Skipping... {EMOJI_SHOCKED}")
@@ -1424,6 +1442,8 @@ async def play_next_track(guild_id: int):
         playback_duration = effective_audio_duration(duration, state["effect"])
         if not is_loop_replay and state["crossfade"] > 0 and playback_duration:
             async def on_transition(next_track):
+                if not playback_is_current():
+                    return
                 state["queue"][:] = [queued for queued in state["queue"] if queued is not next_track]
                 state["current"] = next_track
                 state["history"].append(next_track)
@@ -1451,7 +1471,7 @@ async def play_next_track(guild_id: int):
                 if state["queue"] and state["crossfade"] > 0 and not state["loop"]:
                     following_track = state["queue"][0]
                     following_url, following_duration = await resolve_stream(following_track)
-                    if following_url:
+                    if following_url and playback_is_current():
                         if following_duration is not None:
                             following_track["duration"] = following_duration
                         audio_source.set_next(
@@ -1464,7 +1484,26 @@ async def play_next_track(guild_id: int):
                         )
 
             def transition_callback(next_track):
-                asyncio.run_coroutine_threadsafe(on_transition(next_track), bot.loop)
+                if bot.loop.is_closed():
+                    return
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        on_transition(next_track),
+                        bot.loop
+                    )
+                except RuntimeError as error:
+                    print(f"Crossfade transition scheduling failed: {error}")
+                    return
+
+                def report_transition_error(completed):
+                    try:
+                        error = completed.exception()
+                    except asyncio.CancelledError:
+                        return
+                    if error:
+                        print(f"Crossfade transition update failed: {error}")
+
+                future.add_done_callback(report_transition_error)
 
             audio_source = CrossfadeAudioSource(
                 source,
@@ -1473,19 +1512,22 @@ async def play_next_track(guild_id: int):
                 state["effect"],
                 transition_callback,
                 lambda: (
-                    audio_source._transition_started
-                    or (
-                        not state["loop"]
-                        and bool(state["queue"])
-                        and state["queue"][0] is audio_source.next_track
-                        and bool(audio_source.next_duration)
+                    playback_is_current()
+                    and (
+                        audio_source._transition_started
+                        or (
+                            not state["loop"]
+                            and bool(state["queue"])
+                            and state["queue"][0] is audio_source.next_track
+                            and bool(audio_source.next_duration)
+                        )
                     )
                 )
             )
             if state["queue"]:
                 next_track = state["queue"][0]
                 next_url, next_duration = await resolve_stream(next_track)
-                if next_url:
+                if next_url and playback_is_current():
                     if next_duration is not None:
                         next_track["duration"] = next_duration
                     audio_source.set_next(
@@ -1496,12 +1538,21 @@ async def play_next_track(guild_id: int):
         else:
             audio_source = source
 
+        if not playback_is_current():
+            audio_source.cleanup()
+            return
+
         transformed = discord.PCMVolumeTransformer(audio_source, volume=state["volume"])
+
+        async def continue_playback():
+            if playback_is_current():
+                await play_next_track(guild_id)
 
         def after_callback(err):
             if err:
                 print(f"Playback error: {err}")
-            asyncio.run_coroutine_threadsafe(play_next_track(guild_id), bot.loop)
+            if not bot.loop.is_closed():
+                asyncio.run_coroutine_threadsafe(continue_playback(), bot.loop)
 
         vc.play(transformed, after=after_callback)
 
@@ -1520,6 +1571,8 @@ async def play_next_track(guild_id: int):
             await state["text_channel"].send(embed=embed, view=view)
 
     except Exception as e:
+        if not playback_is_current():
+            return
         if state["text_channel"]:
             await state["text_channel"].send(f"Error starting playback: `{e}`")
         await play_next_track(guild_id)
@@ -1685,6 +1738,9 @@ class NowPlayingView(discord.ui.View):
         state["queue"].clear()
         state["current"] = None
         state["loop"] = False
+        state["leave_vote"] = None
+        state["playback_generation"] += 1
+        state["leaving"] = False
 
         guild = bot.get_guild(self.guild_id)
         vc = guild.voice_client if guild else None
@@ -2177,7 +2233,8 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
         return
     if minutes > MAX_TIMEOUT_MINUTES:
         await ctx.send(
-            f"Timeouts cannot exceed 28 days (`{MAX_TIMEOUT_MINUTES}` minutes)."
+            f"Timeouts must be shorter than 28 days (maximum "
+            f"`{MAX_TIMEOUT_MINUTES}` minutes) to stay within Discord's limit."
         )
         return
     if member.top_role >= ctx.guild.me.top_role:
@@ -2791,7 +2848,7 @@ COMMAND_DESCRIPTIONS = {
     "kick": "Kick a member and record the moderation action.",
     "ban": "Ban a member and record the moderation action.",
     "unban": "Unban a user by their Discord ID.",
-    "timeout": "Temporarily prevent a member from interacting (up to 28 days).",
+    "timeout": "Temporarily prevent a member from interacting (up to 28 days, with a safety margin).",
     "untimeout": "Remove a member's active timeout.",
     "warn": "Add a persistent moderation warning to a member.",
     "warnings": "Show the warnings recorded for a member.",
@@ -2851,7 +2908,7 @@ COMMAND_DESCRIPTIONS = {
     "favorites": "Open the interactive favorites manager.",
     "playlist": "Show playlist commands and syntax.",
     "join": "Connect Penny to your voice channel.",
-    "leave": "Disconnect Penny and clear the music queue.",
+    "leave": "Disconnect Penny and clear the music queue; during playback, a majority leave vote is required.",
     "quotethis": "Quote a message you replied to.",
     "devtest": "Create a temporary test channel and restrict bot activity to it.",
     "undevtest": "End devtest mode and delete its temporary channel.",
@@ -3514,6 +3571,9 @@ async def stop(ctx):
     state["queue"].clear()
     state["current"] = None
     state["loop"] = False
+    state["leave_vote"] = None
+    state["playback_generation"] += 1
+    state["leaving"] = False
 
     vc = ctx.guild.voice_client
     if vc:
@@ -3752,6 +3812,10 @@ async def join(ctx):
 
     channel = ctx.author.voice.channel
     voice_client = ctx.guild.voice_client
+    state = get_music_state(ctx.guild.id)
+    state["leaving"] = False
+    state["leave_in_progress"] = False
+    state["leave_vote"] = None
 
     if voice_client:
         await voice_client.move_to(channel)
@@ -3763,17 +3827,76 @@ async def join(ctx):
 @music_command(aliases=["disconnect"])
 async def leave(ctx):
     voice_client = ctx.guild.voice_client
-    if voice_client:
-        state = get_music_state(ctx.guild.id)
-        state["queue"].clear()
-        state["current"] = None
-        state["loop"] = False
-        await update_vc_status(voice_client.channel, None)
-        await voice_client.disconnect()
-        music_states.pop(ctx.guild.id, None)
-        await ctx.send(f"Disconnected from voice channel. {EMOJI_BOYKISSER_SMOKING}")
-    else:
+    if not voice_client:
         await ctx.send(f"I am not connected to any voice channel in this server. {EMOJI_BOYKISSER_HUH}")
+        return
+
+    state = get_music_state(ctx.guild.id)
+    if state["leave_in_progress"]:
+        await ctx.send("A leave vote has already passed; disconnecting now.")
+        return
+
+    has_active_playback = voice_client.is_playing() or voice_client.is_paused()
+    if has_active_playback:
+        human_members = [
+            member for member in voice_client.channel.members
+            if not member.bot
+        ]
+        human_ids = {member.id for member in human_members}
+        if human_ids:
+            if ctx.author.id not in human_ids:
+                await ctx.send("You must be in Penny's voice channel to vote to leave.")
+                return
+
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            vote = state["leave_vote"]
+            if (
+                vote is None
+                or vote["channel_id"] != voice_client.channel.id
+                or now >= vote["expires_at"]
+            ):
+                vote = {
+                    "channel_id": voice_client.channel.id,
+                    "voters": set(),
+                    "expires_at": now + 30,
+                }
+                state["leave_vote"] = vote
+
+            if ctx.author.id in vote["voters"]:
+                await ctx.send("Your vote to leave has already been counted.")
+                return
+
+            vote["voters"].add(ctx.author.id)
+            required_votes = len(human_ids) // 2 + 1
+            received_votes = len(vote["voters"] & human_ids)
+            if received_votes < required_votes:
+                await ctx.send(
+                    f"Leave vote: `{received_votes}/{required_votes}` votes. "
+                    f"A majority of people in voice must vote within 30 seconds."
+                )
+                return
+
+    state["leave_in_progress"] = True
+    state["leaving"] = True
+    state["playback_generation"] += 1
+    state["leave_vote"] = None
+    state["queue"].clear()
+    state["current"] = None
+    state["loop"] = False
+    cancel_disconnect(ctx.guild.id)
+
+    prefetch_task = state.get("crossfade_prefetch_task")
+    if prefetch_task and not prefetch_task.done():
+        prefetch_task.cancel()
+
+    await update_vc_status(voice_client.channel, None)
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+    await voice_client.disconnect()
+    if music_states.get(ctx.guild.id) is state:
+        music_states.pop(ctx.guild.id, None)
+    await ctx.send(f"Disconnected from voice channel. {EMOJI_BOYKISSER_SMOKING}")
 
 
 # ============================================================

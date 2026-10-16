@@ -121,7 +121,7 @@ the actor as unknown. Message contents may be included in these logs.
 | `;kick @member [reason]` | Kick a member. |
 | `;ban @member [reason]` | Ban a member. |
 | `;unban <user-id>` | Unban a user by ID. |
-| `;timeout @member <minutes> [reason]` | Time out a member for 1–40,320 minutes (up to 28 days). |
+| `;timeout @member <minutes> [reason]` | Time out a member for 1–40,319 minutes (under 28 days, with a one-minute safety margin). |
 | `;untimeout @member` | Remove a member's timeout. |
 | `;warn @member [reason]` | Add a persistent warning. |
 | `;warnings @member` | Show a member's warnings. |
@@ -210,14 +210,16 @@ for each repeat. Crossfade is enabled at five seconds by default for consecutive
 tracks with known durations. It is skipped for unknown-duration sources (such
 as uploaded audio) and while looping; use `/crossfade` or `;crossfade` to set a
 duration from 0 to 10 seconds, where 0 disables crossfade. Slash commands still
-require Penny to be connected to the server voice channel for playback.
+require Penny to be connected to the server voice channel for playback. While
+music is playing, `;leave` / `/leave` starts a 30-second vote; a majority of
+the non-bot members in the voice channel must vote to disconnect Penny.
 
 | Command | Aliases | Description |
 | --- | --- | --- |
 | `;play <search query or URL>` | `;p` | Play a search result or URL; playlist URLs are queued. |
 | `;playfile` | — | Play one supported audio file attached to the command, or reply to a message containing that file and run `;playfile`; supported extensions: `.aac`, `.flac`, `.m4a`, `.mp3`, `.oga`, `.ogg`, `.opus`, `.wav`, `.webm`, and `.wma`. Uploaded files can’t be saved as favorites. |
 | `;join` | — | Join or move to your voice channel. |
-| `;leave` | `;disconnect` | Disconnect and clear the current queue. |
+| `;leave` | `;disconnect` | Disconnect and clear the queue. During playback, requires a majority leave vote from non-bot listeners within 30 seconds. |
 | `;skip` | `;s`, `;next` | Skip the current track. |
 | `;restartsong` | `;replay` | Replay the current track. |
 | `;pause` / `;resume` | — | Pause or resume playback. |
