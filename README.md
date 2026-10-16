@@ -99,7 +99,10 @@ alone does not grant those commands unless that ID is configured.
 
 ## Commands
 
-Use `;help` in Discord for the paginated in-bot command menu.
+Use `;help` in Discord for the paginated in-bot command menu, or request
+details for one command with `;help <command>` (for example,
+`;help timeout`). Hybrid slash commands accept the same lookup through
+`/help command_name:<command>`.
 
 ### Moderation
 
@@ -118,7 +121,7 @@ the actor as unknown. Message contents may be included in these logs.
 | `;kick @member [reason]` | Kick a member. |
 | `;ban @member [reason]` | Ban a member. |
 | `;unban <user-id>` | Unban a user by ID. |
-| `;timeout @member <minutes> [reason]` | Time out a member. |
+| `;timeout @member <minutes> [reason]` | Time out a member for 1–40,320 minutes (up to 28 days). |
 | `;untimeout @member` | Remove a member's timeout. |
 | `;warn @member [reason]` | Add a persistent warning. |
 | `;warnings @member` | Show a member's warnings. |

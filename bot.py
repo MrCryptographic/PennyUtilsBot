@@ -34,6 +34,7 @@ TOKEN = os.getenv("TOKEN")
 
 # Default command prefix
 DEFAULT_PREFIX = ";"
+MAX_TIMEOUT_MINUTES = 28 * 24 * 60
 
 # Users who are allowed to execute moderation commands.
 MODERATOR_IDS = {
@@ -2174,6 +2175,11 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
     if minutes <= 0:
         await ctx.send("The timeout duration must be greater than 0.")
         return
+    if minutes > MAX_TIMEOUT_MINUTES:
+        await ctx.send(
+            f"Timeouts cannot exceed 28 days (`{MAX_TIMEOUT_MINUTES}` minutes)."
+        )
+        return
     if member.top_role >= ctx.guild.me.top_role:
         await ctx.send("I cannot timeout a member whose role is equal to or higher than mine.")
         return
@@ -2778,9 +2784,167 @@ class HelpPaginator(discord.ui.View):
             except Exception:
                 pass
 
-@hybrid_command(name="help")
-async def help_command(ctx):
+COMMAND_DESCRIPTIONS = {
+    "persona": "Show or change your AI chat persona.",
+    "clearchat": "Clear your in-memory AI conversation history.",
+    "chat": "Send a message to your selected AI persona.",
+    "kick": "Kick a member and record the moderation action.",
+    "ban": "Ban a member and record the moderation action.",
+    "unban": "Unban a user by their Discord ID.",
+    "timeout": "Temporarily prevent a member from interacting (up to 28 days).",
+    "untimeout": "Remove a member's active timeout.",
+    "warn": "Add a persistent moderation warning to a member.",
+    "warnings": "Show the warnings recorded for a member.",
+    "clearwarnings": "Remove all stored warnings for a member.",
+    "purge": "Delete recent messages and log their available contents.",
+    "slowmode": "Set this channel's slowmode delay in seconds.",
+    "lock": "Prevent the default role from sending messages in this channel.",
+    "unlock": "Restore the default role's send-message permission.",
+    "nick": "Change or reset a member's server nickname.",
+    "serverinfo": "Show information and statistics about this server.",
+    "userinfo": "Show account and server-member details.",
+    "avatar": "Show a member's profile avatar.",
+    "banner": "Show a member's profile banner, if they have one.",
+    "furry": "Show a playful furry percentage for a member.",
+    "ship": "Calculate a playful compatibility score for two members.",
+    "femboy": "Show a playful femboy percentage for a member.",
+    "kiss": "Send a playful kiss message to a member.",
+    "hug": "Send a playful hug message to a member.",
+    "punch": "Send a playful punch message to a member.",
+    "attack": "Send a randomly selected silly attack message.",
+    "boop": "Send a playful nose-boop message to a member.",
+    "dance": "Dance alone or with another member.",
+    "jarvis": "Create a captioned Jarvis meme GIF.",
+    "lowtiergod": "Create a captioned Low Tier God meme GIF.",
+    "spongebob": "Create a captioned floating SpongeBob meme GIF.",
+    "tuffbob": "Create a captioned TuffBob meme GIF.",
+    "fanumfood": "Create a captioned Fanum Food meme GIF.",
+    "stephen": "Create a captioned Stephen meme image.",
+    "katanaman": "Create a captioned Katana Man meme GIF.",
+    "basketball": "Create a captioned basketball meme GIF.",
+    "tryhard": "Create a captioned Tryhard meme GIF.",
+    "bkleash": "Create a captioned Boykisser Leash meme GIF.",
+    "lockin": "Caption both panels of the Lock In meme.",
+    "announce": "Post an announcement and notify everyone in the server.",
+    "setlog": "Set the server's moderation and message-log channel.",
+    "disablelog": "Turn off moderation and message logging for this server.",
+    "help": "Show the command menu or usage details for a command.",
+    "disable": "Disable a command in this server or globally.",
+    "enable": "Re-enable a command in this server or globally.",
+    "blacklist": "View or manage the bot's user blacklist.",
+    "restart": "Save bot data and restart the bot process.",
+    "play": "Play a search result, URL, or URL playlist in your voice channel.",
+    "playfile": "Play an audio attachment or a file from a replied-to message.",
+    "skip": "Skip the currently playing track.",
+    "restartsong": "Restart the currently playing track.",
+    "pause": "Pause current music playback.",
+    "resume": "Resume paused music playback.",
+    "stop": "Stop playback and clear the music queue.",
+    "queue": "Show the interactive music queue.",
+    "nowplaying": "Show the current track and its player controls.",
+    "volume": "Show or set the music playback volume from 1 to 100.",
+    "loop": "Toggle repeating the current track.",
+    "crossfade": "Show or set the track crossfade duration from 0 to 10 seconds.",
+    "effect": "Show the audio-effects menu or select a music filter.",
+    "autorestart": "Toggle restarting a track when its audio effect changes.",
+    "favorite": "Save the current track or a searched track to favorites.",
+    "favorites": "Open the interactive favorites manager.",
+    "playlist": "Show playlist commands and syntax.",
+    "join": "Connect Penny to your voice channel.",
+    "leave": "Disconnect Penny and clear the music queue.",
+    "quotethis": "Quote a message you replied to.",
+    "devtest": "Create a temporary test channel and restrict bot activity to it.",
+    "undevtest": "End devtest mode and delete its temporary channel.",
+    "ping": "Show the bot's gateway latency.",
+    "botinfo": "Show the bot version and runtime statistics.",
+    "autoreply": "Show the status of the disabled autoreply feature.",
+    "prefix": "Show or change this server's command prefix.",
+    "autoplay": "Toggle related-track playback when the queue ends.",
+    "playlist create": "Create a personal playlist or a moderator-managed server playlist.",
+    "playlist add": "Add a searched track or the current track to a playlist.",
+    "playlist play": "Queue and play one of your playlists.",
+    "playlist view": "View a playlist and its interactive controls.",
+    "playlist list": "List your personal playlists or server playlists.",
+    "playlist remove": "Remove a numbered track from a playlist.",
+    "playlist delete": "Delete one of your personal or server playlists.",
+    "blacklist add": "Add a user to the blacklist, optionally for one command.",
+    "blacklist remove": "Remove a user or command-specific blacklist entry.",
+    "blacklist list": "Show the configured blacklist.",
+    "autoreply list": "Show autoreply settings (the feature is currently disabled).",
+    "autoreply add": "Add an autoreply entry (the feature is currently disabled).",
+    "autoreply remove": "Remove an autoreply entry (the feature is currently disabled).",
+    "autoreply cooldown": "Set the autoreply cooldown (the feature is currently disabled).",
+}
+
+
+def configure_command_descriptions():
+    for command in bot.walk_commands():
+        description = COMMAND_DESCRIPTIONS.get(command.qualified_name)
+        if description is None:
+            description = COMMAND_DESCRIPTIONS.get(command.name)
+        if description is None:
+            readable_name = command.qualified_name.replace(" ", " ").replace("_", " ")
+            description = f"Run {readable_name} to use this bot feature."
+        command.description = description
+        command.help = description
+        app_command = getattr(command, "app_command", None)
+        if app_command is not None:
+            app_command.description = description[:100]
+
+
+@hybrid_command(name="help", description="Show the command menu or details for one command.")
+async def help_command(ctx, command_name: str = None):
     prefix = get_prefix(bot, ctx.message)
+
+    if command_name:
+        parts = command_name.strip().lstrip("/").split()
+        command = bot.get_command(parts[0]) if parts else None
+        for part in parts[1:]:
+            command = command.get_command(part) if isinstance(command, commands.Group) else None
+            if command is None:
+                break
+
+        if command is None:
+            await ctx.send(f"I couldn't find a command named `{command_name}`.")
+            return
+
+        aliases = ", ".join(f"`{alias}`" for alias in command.aliases)
+        usage_signature = command.signature
+        usage_signature = usage_signature.replace(
+            "[reason=No reason provided]",
+            "[reason]"
+        )
+        prefix_usage = f"`{prefix}{command.qualified_name}"
+        if usage_signature:
+            prefix_usage += f" {usage_signature}"
+        prefix_usage += "`"
+
+        embed = discord.Embed(
+            title=f"Help: {command.qualified_name}",
+            description=command.help or command.description,
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Prefix usage", value=prefix_usage, inline=False)
+        if getattr(command, "app_command", None) is not None:
+            slash_usage = f"`/{command.qualified_name}"
+            if usage_signature:
+                slash_usage += f" {usage_signature}"
+            slash_usage += "`"
+            embed.add_field(name="Slash usage", value=slash_usage, inline=False)
+        if aliases:
+            embed.add_field(name="Aliases", value=aliases, inline=False)
+        if isinstance(command, commands.Group) and command.commands:
+            embed.add_field(
+                name="Subcommands",
+                value="\n".join(
+                    f"`{subcommand.name}` — {subcommand.description}"
+                    for subcommand in command.commands
+                ),
+                inline=False
+            )
+        await ctx.send(embed=embed)
+        return
+
     pages = []
 
     embed1 = discord.Embed(
@@ -4061,6 +4225,9 @@ async def playlist_delete(ctx, pl_name: str, *, flag: str = ""):
     del pls[pl_name]
     save_playlists()
     await ctx.send(f"Deleted playlist **{pl_name}**.")
+
+
+configure_command_descriptions()
 
 
 # ============================================================
