@@ -6,3 +6,6 @@
 /bot_data.json
 /playlists.json
 /command_usage.json
+/.continue
+/.continue/mcpServers
+/.continue/mcpServers/fetch.yaml
