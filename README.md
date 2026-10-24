@@ -234,7 +234,7 @@ the non-bot members in the voice channel must vote to disconnect Penny.
 | `;effect [name]` | `;effects`, `;filter` | Open the effect menu or set `none`, `reverb`, `bassboost`, `superbassboost`, `very_loud`, `nightcore`, `vaporwave`, `8d`, or `echo`. |
 | `;autorestart` | `;autorestartfx`, `;autorestarteffect` | Toggle restarting the current track when an effect changes. |
 | `;autoplay` | `;ap`, `;auto` | Toggle automatic related-track playback when the queue ends. |
-| `;favorite [search query or URL]` | `;fav` | Save the current track, or look up and save a supplied track. Favorites are saved to both this server and your personal list. Uploaded Discord audio files cannot be favorited. |
+| `;favorite [search query or URL]` | `;fav` | Save the current track, look up and save a supplied track, or save every track from a playlist URL. Favorites are saved to both this server and your personal list. Uploaded Discord audio files cannot be favorited. |
 | `;favorites` | `;favs` | Open the interactive server/personal favorites manager. |
 
 ### Playlists
@@ -248,7 +248,7 @@ group is `/playlist` with the same subcommands; use its `flag` option for
 | Command | Description |
 | --- | --- |
 | `;playlist create <name> [--server]` | Create a personal or server playlist. |
-| `;playlist add <name> [search query or URL] [--server]` | Add the supplied track, or the currently playing track when omitted. |
+| `;playlist add <name> [search query or URL] [--server]` | Add the supplied track, every track from a playlist URL, or the currently playing track when omitted. |
 | `;playlist play <name> [--server]` | Queue and play a playlist. |
 | `;playlist list [--server]` | List your personal or server playlists. |
 | `;playlist view <name> [--server]` | View tracks with an interactive play control. |

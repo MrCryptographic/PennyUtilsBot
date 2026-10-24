@@ -2931,7 +2931,7 @@ COMMAND_DESCRIPTIONS = {
     "prefix": "Show or change this server's command prefix.",
     "autoplay": "Toggle related-track playback when the queue ends.",
     "playlist create": "Create a personal playlist or a moderator-managed server playlist.",
-    "playlist add": "Add a searched track or the current track to a playlist.",
+    "playlist add": "Add searched tracks, playlist tracks, or the current track to a playlist.",
     "playlist play": "Queue and play one of your playlists.",
     "playlist view": "View a playlist and its interactive controls.",
     "playlist list": "List your personal playlists or server playlists.",
@@ -3141,7 +3141,7 @@ async def help_command(ctx, command_name: str = None):
             f"`{prefix}favorite` — Save current song or link to favorites\n"
             f"`{prefix}favorites` — Interactive favorites manager (with Play All!)\n"
             f"`{prefix}playlist create <name> [--server]` — Create personal or server playlist\n"
-            f"`{prefix}playlist add <name> [url] [--server]` — Add track to playlist\n"
+            f"`{prefix}playlist add <name> [url] [--server]` — Add track(s) to playlist\n"
             f"`{prefix}playlist play <name> [--server]` — Queue and play a playlist\n"
             f"`{prefix}playlist list [--server]` — View all saved playlists\n"
             f"`{prefix}playlist view <name> [--server]` — View tracks in a playlist\n"
@@ -3724,7 +3724,7 @@ async def autorestart(ctx):
 @music_command(aliases=["fav"])
 async def favorite(ctx, *, query: str = None):
     state = get_music_state(ctx.guild.id)
-    target_track = None
+    is_playlist = False
 
     if query:
         if is_discord_attachment_url(query.strip("<>")):
@@ -3737,54 +3737,102 @@ async def favorite(ctx, *, query: str = None):
                 with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
                     return ydl.extract_info(query, download=False)
             data_info = await loop.run_in_executor(None, _extract)
-            if 'entries' in data_info and data_info['entries']:
-                entry = data_info['entries'][0]
-                target_track = {'title': entry.get('title', 'Unknown Track'), 'webpage_url': entry.get('webpage_url') or entry.get('url')}
-            else:
-                target_track = {'title': data_info.get('title', 'Unknown Track'), 'webpage_url': data_info.get('webpage_url') or data_info.get('url')}
         except Exception as e:
             await ctx.send(f"Failed to lookup song: `{e}`")
             return
+
+        if not data_info:
+            await ctx.send(f"No results found for `{query}`.")
+            return
+
+        entries = data_info.get("entries")
+        is_search = data_info.get("extractor_key") in ("YoutubeSearch", "YoutubeSearchURL")
+        is_playlist = entries is not None and not is_search
+        if entries is not None:
+            entries = [entry for entry in entries if entry]
+            if is_search:
+                entries = entries[:1]
+        else:
+            entries = [data_info]
+
+        target_tracks = []
+        for entry in entries:
+            track_url = entry.get("webpage_url")
+            if not track_url and entry.get("id") and "youtube" in (
+                entry.get("extractor_key") or data_info.get("extractor_key", "")
+            ).lower():
+                track_url = f"https://www.youtube.com/watch?v={entry['id']}"
+            if not track_url:
+                track_url = entry.get("url")
+            if track_url:
+                target_tracks.append({
+                    "title": entry.get("title", "Unknown Track"),
+                    "webpage_url": track_url,
+                })
+
+        if not target_tracks:
+            await ctx.send(f"No tracks found for `{query}`.")
+            return
     elif state["current"]:
-        target_track = state["current"]
+        target_tracks = [state["current"]]
     else:
         await ctx.send(f"No song is currently playing! Provide a link or search query: `;favorite <query>` {EMOJI_BOYKISSER_HUH}")
         return
 
-    target_url = target_track.get("webpage_url") or ""
-    if target_track.get("is_attachment") or is_discord_attachment_url(target_url):
+    if any(
+        track.get("is_attachment")
+        or is_discord_attachment_url(track.get("webpage_url") or "")
+        for track in target_tracks
+    ):
         await ctx.send("Uploaded Discord audio files cannot be added to favorites.")
         return
 
     guild_id_str = str(ctx.guild.id)
     user_id_str = str(ctx.author.id)
-
-    clean_title = sanitize_markdown(target_track["title"], max_len=60)
-    fav_item_guild = {
-        "title": clean_title,
-        "url": target_track["webpage_url"],
-        "user_id": ctx.author.id,
-        "user_name": str(ctx.author),
-        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
-    fav_item_user = {
-        "title": clean_title,
-        "url": target_track["webpage_url"],
-        "guild_id": ctx.guild.id,
-        "guild_name": ctx.guild.name,
-        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
-
     g_list = favorites_data["guilds"].setdefault(guild_id_str, [])
-    if not any(item["url"] == target_track["webpage_url"] for item in g_list):
-        g_list.append(fav_item_guild)
-
     u_list = favorites_data["users"].setdefault(user_id_str, [])
-    if not any(item["url"] == target_track["webpage_url"] for item in u_list):
-        u_list.append(fav_item_user)
+    saved_count = 0
+
+    for target_track in target_tracks:
+        track_url = target_track["webpage_url"]
+        clean_title = sanitize_markdown(target_track["title"], max_len=60)
+        added_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        added = False
+
+        if not any(item["url"] == track_url for item in g_list):
+            g_list.append({
+                "title": clean_title,
+                "url": track_url,
+                "user_id": ctx.author.id,
+                "user_name": str(ctx.author),
+                "added_at": added_at
+            })
+            added = True
+
+        if not any(item["url"] == track_url for item in u_list):
+            u_list.append({
+                "title": clean_title,
+                "url": track_url,
+                "guild_id": ctx.guild.id,
+                "guild_name": ctx.guild.name,
+                "added_at": added_at
+            })
+            added = True
+
+        if added:
+            saved_count += 1
 
     save_favorites()
-    await ctx.send(f"Saved **{clean_title}** to favorites! ❤️ {EMOJI_LOVE}")
+    if is_playlist:
+        playlist_title = sanitize_markdown(data_info.get("title", "playlist"), max_len=60)
+        await ctx.send(
+            f"Saved **{saved_count}** new track(s) from **{playlist_title}** to favorites! ❤️ {EMOJI_LOVE}"
+        )
+    elif saved_count:
+        clean_title = sanitize_markdown(target_tracks[0]["title"], max_len=60)
+        await ctx.send(f"Saved **{clean_title}** to favorites! ❤️ {EMOJI_LOVE}")
+    else:
+        await ctx.send("Those track(s) are already in your favorites.")
 
 @music_command(aliases=["favs"])
 async def favorites(ctx):
@@ -4173,7 +4221,8 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
         is_server = True
         pl_name = pl_name.replace("--server", "").strip()
 
-    target_track = None
+    target_tracks = []
+    is_playlist = False
     state = get_music_state(ctx.guild.id) if ctx.guild else None
 
     if query:
@@ -4183,26 +4232,45 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
                 with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
                     return ydl.extract_info(query, download=False)
             data_info = await loop.run_in_executor(None, _extract)
-            if 'entries' in data_info and data_info['entries']:
-                entry = data_info['entries'][0]
-                target_track = {'title': entry.get('title', 'Unknown Track'), 'webpage_url': entry.get('webpage_url') or entry.get('url')}
-            else:
-                target_track = {'title': data_info.get('title', 'Unknown Track'), 'webpage_url': data_info.get('webpage_url') or data_info.get('url')}
         except Exception as e:
             await ctx.send(f"Failed to lookup track: `{e}`")
             return
+
+        if not data_info:
+            await ctx.send(f"No results found for `{query}`.")
+            return
+
+        entries = data_info.get("entries")
+        is_search = data_info.get("extractor_key") in ("YoutubeSearch", "YoutubeSearchURL")
+        is_playlist = entries is not None and not is_search
+        if entries is not None:
+            entries = [entry for entry in entries if entry]
+            if is_search:
+                entries = entries[:1]
+        else:
+            entries = [data_info]
+
+        for entry in entries:
+            track_url = entry.get("webpage_url")
+            if not track_url and entry.get("id") and "youtube" in (
+                entry.get("extractor_key") or data_info.get("extractor_key", "")
+            ).lower():
+                track_url = f"https://www.youtube.com/watch?v={entry['id']}"
+            if not track_url:
+                track_url = entry.get("url")
+            if track_url:
+                target_tracks.append({
+                    "title": entry.get("title", "Unknown Track"),
+                    "webpage_url": track_url,
+                })
+        if not target_tracks:
+            await ctx.send(f"No tracks found for `{query}`.")
+            return
     elif state and state["current"]:
-        target_track = state["current"]
+        target_tracks = [state["current"]]
     else:
         await ctx.send("No track specified or currently playing! Usage: `;playlist add <name> [query] [--server]`")
         return
-
-    clean_title = sanitize_markdown(target_track["title"], max_len=60)
-    track_item = {
-        "title": clean_title,
-        "url": target_track["webpage_url"],
-        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
 
     if is_server:
         if not has_installed_guild(ctx):
@@ -4215,17 +4283,37 @@ async def playlist_add(ctx, pl_name: str, *, query: str = None):
         if pl_name not in g_pls:
             await ctx.send(f"Server playlist **{pl_name}** does not exist!")
             return
-        g_pls[pl_name].append(track_item)
-        save_playlists()
-        await ctx.send(f"Added **{clean_title}** to server playlist **{pl_name}**! 🌐")
+        destination = g_pls[pl_name]
     else:
         u_pls = playlists_data["users"].get(str(ctx.author.id), {})
         if pl_name not in u_pls:
             await ctx.send(f"You don't have a playlist named **{pl_name}**! Create it first with `;playlist create {pl_name}`.")
             return
-        u_pls[pl_name].append(track_item)
+        destination = u_pls[pl_name]
+
+    for target_track in target_tracks:
+        destination.append({
+            "title": sanitize_markdown(target_track["title"], max_len=60),
+            "url": target_track["webpage_url"],
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+
+    if is_server:
         save_playlists()
-        await ctx.send(f"Added **{clean_title}** to your playlist **{pl_name}**! 👤")
+        if is_playlist:
+            playlist_title = sanitize_markdown(data_info.get("title", "playlist"), max_len=60)
+            await ctx.send(f"Added **{len(target_tracks)}** track(s) from **{playlist_title}** to server playlist **{pl_name}**! 🌐")
+        else:
+            clean_title = sanitize_markdown(target_tracks[0]["title"], max_len=60)
+            await ctx.send(f"Added **{clean_title}** to server playlist **{pl_name}**! 🌐")
+    else:
+        save_playlists()
+        if is_playlist:
+            playlist_title = sanitize_markdown(data_info.get("title", "playlist"), max_len=60)
+            await ctx.send(f"Added **{len(target_tracks)}** track(s) from **{playlist_title}** to your playlist **{pl_name}**! 👤")
+        else:
+            clean_title = sanitize_markdown(target_tracks[0]["title"], max_len=60)
+            await ctx.send(f"Added **{clean_title}** to your playlist **{pl_name}**! 👤")
 
 
 @playlist.command(name="play")
