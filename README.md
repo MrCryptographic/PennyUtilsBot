@@ -73,10 +73,11 @@ the optional AI chat.
    requests all Discord intents, so enable any privileged intents required by
    your application.
 4. Keep the following meme templates in the `assets` folder:
-   `basketball.gif`, `boykisser-leash.gif`, `fanumfood.gif`, `jarvis.gif`,
-   `lockin.png`, `lowtiergod.gif`, `reason.gif`, `spongebob.gif`,
-   `stephen.jpg`, `tryhard.gif`, and `tuffbob.gif`. The `impact.ttf` font is
-   included in the project root; the bot also falls back to system fonts.
+   `basketball.gif`, `boykisser-leash.gif`, `ejarvis.gif`, `fanumfood.gif`,
+   `jarvis.gif`, `lockin.png`, `lowtiergod.gif`, `reason.gif`,
+   `spongebob.gif`, `stephen.jpg`, `tryhard.gif`, and `tuffbob.gif`. The
+   `impact.ttf` font is included in the project root; the bot also falls back
+   to system fonts.
 5. Start the bot:
 
    ```bash
@@ -172,6 +173,7 @@ using the matching image in `assets` (or the project root as a fallback).
 | Command | Aliases | Description |
 | --- | --- | --- |
 | `;jarvis <text>` | — | Caption the Jarvis template. |
+| `;ejarvis <text>` | — | Caption the E-Jarvis template. |
 | `;lowtiergod <text>` | — | Caption the Low Tier God template. |
 | `;spongebob <text>` | `;floating`, `;ascend`, `;sponge` | Caption the floating SpongeBob template. |
 | `;tuffbob <text>` | `;tuff`, `;hoodiebob`, `;sadbob` | Caption the TuffBob template. |

@@ -2482,7 +2482,7 @@ async def banner(ctx, member: discord.Member = None):
 @hybrid_command()
 async def furry(ctx, member: discord.Member = None):
     member = member or ctx.author
-    percentage = random.Random(member.id).randint(0, 100)
+    percentage = random.randint(0, 100)
     if percentage < 30:
         message = f"{member.mention} is only **{percentage}%** furry! {EMOJI_SHOCKED}"
     elif percentage < 75:
@@ -2498,8 +2498,7 @@ async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
     if user1 == user2:
         await ctx.send(f"You can't ship someone with themselves! {EMOJI_BOYKISSER_HUH}")
         return
-    ids = "".join(sorted((str(user1.id), str(user2.id))))
-    percentage = random.Random(ids).randint(0, 100)
+    percentage = random.randint(0, 100)
     if percentage < 25:
         message = f"💔 **{percentage}%**... {user1.mention} and {user2.mention} might want to stay friends. {EMOJI_SHOCKED}"
     elif percentage < 75:
@@ -2511,7 +2510,7 @@ async def ship(ctx, user1: discord.Member, user2: discord.Member = None):
 @hybrid_command()
 async def femboy(ctx, member: discord.Member = None):
     member = member or ctx.author
-    percentage = random.Random(member.id).randint(0, 100)
+    percentage = random.randint(0, 100)
     if percentage < 30:
         message = f"{member.mention} is only **{percentage}%** femboy! {EMOJI_SHOCKED}"
     elif percentage < 75:
@@ -2583,8 +2582,17 @@ async def dance(ctx, member: discord.Member = None):
     await ctx.send(message)
 
 async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: str):
+    async def send_message(content=None, **kwargs):
+        interaction = ctx.interaction
+        if interaction is None:
+            return await ctx.send(content, **kwargs)
+        if interaction.response.is_done():
+            return await interaction.followup.send(content, wait=True, **kwargs)
+        await interaction.response.send_message(content, **kwargs)
+        return await interaction.original_response()
+
     if not text or not text.strip():
-        await ctx.send(f"Please provide some text for {meme_name}! {EMOJI_BOYKISSER_HUH}")
+        await send_message(f"Please provide some text for {meme_name}! {EMOJI_BOYKISSER_HUH}")
         return
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2602,10 +2610,10 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
         None
     )
     if asset_path is None:
-        await ctx.send(f"**Error:** `{filename_base}` was not found in the assets or bot folder.")
+        await send_message(f"**Error:** `{filename_base}` was not found in the assets or bot folder.")
         return
 
-    status = await ctx.send(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
+    status = await send_message(f"Generating {meme_name} GIF... please wait! {EMOJI_BOYKISSER_SEE}")
     output_path = os.path.join(
         script_dir,
         f"{os.path.splitext(os.path.basename(filename_base))[0]}_{ctx.message.id}.gif"
@@ -2647,7 +2655,7 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
                 loop=image.info.get("loop", 0)
             )
 
-        await ctx.send(file=discord.File(output_path))
+        await send_message(file=discord.File(output_path))
         await status.delete()
     except (OSError, ValueError, discord.HTTPException) as error:
         await status.edit(content=f"Could not generate {meme_name}: `{error}`")
@@ -2658,6 +2666,10 @@ async def render_captioned_gif(ctx, filename_base: str, meme_name: str, text: st
 @hybrid_command()
 async def jarvis(ctx, *, text: str = None):
     await render_captioned_gif(ctx, "jarvis.gif", "Jarvis", text)
+
+@hybrid_command()
+async def ejarvis(ctx, *, text: str = None):
+    await render_captioned_gif(ctx, "ejarvis.gif", "E-Jarvis", text)
 
 @hybrid_command()
 async def lowtiergod(ctx, *, text: str = None):
@@ -2872,6 +2884,7 @@ COMMAND_DESCRIPTIONS = {
     "boop": "Send a playful nose-boop message to a member.",
     "dance": "Dance alone or with another member.",
     "jarvis": "Create a captioned Jarvis meme GIF.",
+    "ejarvis": "Create a captioned E-Jarvis meme GIF.",
     "lowtiergod": "Create a captioned Low Tier God meme GIF.",
     "spongebob": "Create a captioned floating SpongeBob meme GIF.",
     "tuffbob": "Create a captioned TuffBob meme GIF.",
@@ -3082,6 +3095,7 @@ async def help_command(ctx, command_name: str = None):
         name="Commands",
         value=(
             f"`{prefix}jarvis <text>` — Caption the Jarvis explanation GIF\n"
+            f"`{prefix}ejarvis <text>` — Caption the E-Jarvis GIF\n"
             f"`{prefix}lowtiergod <text>` — Caption the Low Tier God GIF\n"
             f"`{prefix}spongebob <text>` — Caption Spongebob floating to music\n"
             f"`{prefix}tuffbob <text>` — Caption the Tuff Spongebob GIF\n"
@@ -4459,6 +4473,10 @@ async def on_raw_message_delete(payload):
         purge_log_suppression.discard(payload.message_id)
         return
 
+    log_channel_id = data["logs"].get(str(payload.guild_id))
+    if log_channel_id is not None and str(log_channel_id) == str(payload.channel_id):
+        return
+
     guild = bot.get_guild(payload.guild_id)
     if guild is None:
         return
@@ -4497,6 +4515,10 @@ async def on_raw_bulk_message_delete(payload):
     purge_log_suppression.difference_update(suppressed_ids)
     remaining_ids = message_ids - suppressed_ids
     if not remaining_ids:
+        return
+
+    log_channel_id = data["logs"].get(str(payload.guild_id))
+    if log_channel_id is not None and str(log_channel_id) == str(payload.channel_id):
         return
 
     guild = bot.get_guild(payload.guild_id)
