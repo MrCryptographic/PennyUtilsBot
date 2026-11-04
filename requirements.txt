@@ -4,3 +4,5 @@ yt-dlp
 PyNaCl
 Pillow
 aiohttp
+davey
+discord

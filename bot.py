@@ -1060,7 +1060,7 @@ def get_ffmpeg_options(effect_name: str = None):
     if effect_name and effect_name in EFFECT_FILTERS and EFFECT_FILTERS[effect_name]:
         options += f" -af {EFFECT_FILTERS[effect_name]}"
     return {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"',
+        'before_options': '-hide_banner -loglevel warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"',
         'options': options
     }
 
@@ -1180,6 +1180,7 @@ class CrossfadeAudioSource(discord.AudioSource):
         try:
             self.next_source = discord.FFmpegPCMAudio(
                 self.next_stream_url,
+                stderr=sys.stderr,
                 **get_ffmpeg_options(self.effect)
             )
         except (OSError, discord.ClientException) as error:
@@ -1438,7 +1439,7 @@ async def play_next_track(guild_id: int):
             track["duration"] = duration
 
         ffmpeg_opts = get_ffmpeg_options(state["effect"])
-        source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
+        source = discord.FFmpegPCMAudio(stream_url, stderr=sys.stderr, **ffmpeg_opts)
         playback_duration = effective_audio_duration(duration, state["effect"])
         if not is_loop_replay and state["crossfade"] > 0 and playback_duration:
             async def on_transition(next_track):
@@ -1551,10 +1552,15 @@ async def play_next_track(guild_id: int):
         def after_callback(err):
             if err:
                 print(f"Playback error: {err}")
+                traceback.print_exception(type(err), err, err.__traceback__)
             if not bot.loop.is_closed():
                 asyncio.run_coroutine_threadsafe(continue_playback(), bot.loop)
 
         vc.play(transformed, after=after_callback)
+        print(
+            f"[Music] Started playback for {track['title']!r} "
+            f"(voice client playing: {vc.is_playing()})"
+        )
 
         clean_title = sanitize_markdown(track["title"], max_len=60)
         if vc.channel:
@@ -1573,6 +1579,8 @@ async def play_next_track(guild_id: int):
     except Exception as e:
         if not playback_is_current():
             return
+        print(f"[Music] Failed to start {track.get('title', 'unknown track')!r}: {e}")
+        traceback.print_exc()
         if state["text_channel"]:
             await state["text_channel"].send(f"Error starting playback: `{e}`")
         await play_next_track(guild_id)
